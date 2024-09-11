@@ -118,22 +118,16 @@ function RandomFBXFiles() {
       }
     };
   }, []);
-  useEffect(() => {
-    enablefycontrols();
-    return () => {
-        disableflycontrols();
-    };
-}, [flySpeed, flyrotationSpeed]);
 
   const initScene = () => {
     const scene = new THREE.Scene();
-    const camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 100);
+    const camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
     const renderer = new THREE.WebGLRenderer();
     renderer.setSize(window.innerWidth, window.innerHeight);
     renderer.setClearColor(0x00ffff);
     mountRef.current.appendChild(renderer.domElement);
 
-    
+    // const controls = new OrbitControls(camera, renderer.domElement);
 
     const ambientLight = new THREE.AmbientLight(0xffffff, 0.5);
     scene.add(ambientLight);
@@ -147,14 +141,25 @@ function RandomFBXFiles() {
     rendererRef.current = renderer;
     // controlsRef.current = controls;
 
-    const animate = () => {
-      requestAnimationFrame(animate);
-    //   controls.update();
-      renderer.render(scene, camera);
-      updateCullingStats();
-    };
     animate();
   };
+
+  const animate = () => {
+    requestAnimationFrame(animate);
+    if (controlsRef.current) controlsRef.current.update();
+    if (rendererRef.current && sceneRef.current && cameraRef.current) {
+      rendererRef.current.render(sceneRef.current, cameraRef.current);
+      updateCullingStats();
+    }
+  };
+  useEffect(() => {
+    enablefycontrols();
+    return () => {
+        disableflycontrols();
+    };
+}, [flySpeed, flyrotationSpeed]);
+
+ 
 
   const handleFileChange = async (event) => {
     const selectedFiles = Array.from(event.target.files);
@@ -238,7 +243,7 @@ function RandomFBXFiles() {
       const mesh = new THREE.Mesh(geometry, material);
       mesh.name = 'boundingBox';
       mesh.position.copy(center);
-      sceneRef.current.add(mesh);
+      // sceneRef.current.add(mesh);
 
       const maxDim = Math.max(size.x, size.y, size.z);
       const fov = cameraRef.current.fov * (Math.PI / 180);
@@ -247,8 +252,8 @@ function RandomFBXFiles() {
 
       cameraRef.current.position.set(center.x, center.y, center.z + cameraZ);
       cameraRef.current.lookAt(center);
-    //   controlsRef.current.target.copy(center);
-    //   controlsRef.current.update();
+      // controlsRef.current.target.copy(center);
+      // controlsRef.current.update();
     }
   };
 
@@ -271,7 +276,7 @@ function RandomFBXFiles() {
         sceneRef.current.remove(octreeVisualizerRef.current);
       }
       octreeVisualizerRef.current = visualizeOctree(octreeRef.current);
-      sceneRef.current.add(octreeVisualizerRef.current);
+      // sceneRef.current.add(octreeVisualizerRef.current);
     }
   };
 
@@ -317,49 +322,76 @@ function RandomFBXFiles() {
     const frustum = new THREE.Frustum();
     const cameraViewProjectionMatrix = new THREE.Matrix4();
     
+    // Update camera matrices
     camera.updateMatrixWorld();
     cameraViewProjectionMatrix.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
     frustum.setFromProjectionMatrix(cameraViewProjectionMatrix);
-
+  
     let frustumCulled = 0;
     let frustumUnculled = 0;
     let occlusionCulled = 0;
     let occlusionUnculled = 0;
-    const objects = [];
-
-    // Traverse all meshes and perform frustum culling
+    const objectsToCheck = [];
+    
+    // Traverse scene and perform frustum culling
     sceneRef.current.traverse((child) => {
-        if (child.isMesh) {
-            const boundingBox = new THREE.Box3().setFromObject(child);
-            if (frustum.intersectsBox(boundingBox)) {
-
-                frustumUnculled++;
-                objects.push(child); // Store objects for raycasting check
-            } else {
-                frustumCulled++;
-            }
-        }
-    });
-
-    // Raycasting for occlusion culling
-    objects.forEach((obj) => {
-        raycasterRef.current.set(camera.position, obj.position.clone().sub(camera.position).normalize());
-        const intersects = raycasterRef.current.intersectObjects(objects, true);
-        if (intersects.length > 0 && intersects[0].object !== obj) {
-            obj.visible = false
-            occlusionCulled++;
+      if (child.isMesh) {
+        const boundingBox = new THREE.Box3().setFromObject(child);
+        
+        // Frustum culling
+        if (frustum.intersectsBox(boundingBox)) {
+          frustumUnculled++;
+          objectsToCheck.push(child); // Save for occlusion check
         } else {
-            obj.visible = true
-            occlusionUnculled++;
+          frustumCulled++;
+          child.visible = false; // Hide objects outside the frustum
         }
+      }
     });
-
+  
+    // Perform raycasting for occlusion culling
+    const raycaster = new THREE.Raycaster();
+    objectsToCheck.forEach((obj) => {
+      // Compute the bounding sphere for more accurate raycasting
+      obj.geometry.computeBoundingSphere();
+      const boundingSphere = obj.geometry.boundingSphere;
+      const direction = boundingSphere.center.clone().sub(camera.position).normalize();
+      
+      // Set ray from the camera to the object's bounding sphere center
+      raycaster.set(camera.position, direction);
+      
+      // Perform raycasting against all objects within the frustum
+      const intersects = raycaster.intersectObjects(objectsToCheck, true);
+      
+      if (intersects.length > 0) {
+        // Check if any object is blocking the current object
+        const closestIntersect = intersects[0];
+        
+        if (closestIntersect.object !== obj && closestIntersect.distance < boundingSphere.center.distanceTo(camera.position)) {
+          // An object is blocking this one, mark it occluded
+          obj.visible = false;
+          occlusionCulled++;
+        } else {
+          // No object blocking this one, mark it visible
+          obj.visible = true;
+          occlusionUnculled++;
+        }
+      } else {
+        // No intersections, make the object visible
+        obj.visible = true;
+        occlusionUnculled++;
+      }
+    });
+  
+    // Update stats
     setFrustumCulledCount(frustumCulled);
     setFrustumUnculledCount(frustumUnculled);
     setOcclusionCulledCount(occlusionCulled);
     setOcclusionUnculledCount(occlusionUnculled);
-    setTotalMeshes(objects.length + frustumCulled + frustumUnculled); // Total meshes
-};
+    setTotalMeshes(frustumCulled + frustumUnculled); // Total meshes
+  };
+  
+  
 
 let continueTranslation = false;
 let continueRotation = false;
@@ -509,10 +541,10 @@ const handleMouseDown = (event) => {
         cameraRef.current.lookAt(center);
     }
 return (
-    <div>     
-        <div ref={mountRef} style={{ width: '100%', height: '500px' }} />
+    <div >     
+        <div ref={mountRef}  style={{width:'100%',height:'100px'}}  />
         <input type="file" multiple onChange={handleFileChange} accept=".fbx" />
-        <LoadingBar progress={loadingProgress} />
+        {/* <LoadingBar progress={loadingProgress} /> */}
         <button onClick={fitView} className='btn'>fitview</button>
         {boundingBox && (
             <div>
@@ -530,6 +562,7 @@ return (
             <p>Occlusion Culled Count: {occlusionCulledCount}</p>
             <p>Occlusion Unculled Count: {occlusionUnculledCount}</p>
         </div>
+       
     </div>
 );
 
