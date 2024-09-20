@@ -1,0 +1,941 @@
+import React, { useState, useEffect, useRef } from 'react';
+import * as THREE from 'three';
+import { FBXLoader } from 'three/examples/jsm/loaders/FBXLoader';
+import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls';
+import { MeshBVH, MeshBVHHelper } from 'three-mesh-bvh';
+import LoadingBar from './LoadingBar';
+import { GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader";
+import { GLTFExporter } from "three/examples/jsm/exporters/GLTFExporter";
+import pako from 'pako';
+
+// Octree implementation
+class Octree {
+    constructor(center, size) {
+      this.center = center;
+      this.size = size;
+      this.children = [];
+      this.objects = [];
+      this.divided = false;
+      this.boundingBox = new THREE.Box3().setFromCenterAndSize(this.center, new THREE.Vector3(this.size, this.size, this.size));
+    }
+  subdivide() {
+    const { x, y, z } = this.center;
+    const newSize = this.size / 2;
+    const offset = newSize / 2;
+
+    this.children = [
+      new Octree(new THREE.Vector3(x - offset, y - offset, z - offset), newSize),
+      new Octree(new THREE.Vector3(x + offset, y - offset, z - offset), newSize),
+      new Octree(new THREE.Vector3(x - offset, y + offset, z - offset), newSize),
+      new Octree(new THREE.Vector3(x + offset, y + offset, z - offset), newSize),
+      new Octree(new THREE.Vector3(x - offset, y - offset, z + offset), newSize),
+      new Octree(new THREE.Vector3(x + offset, y - offset, z + offset), newSize),
+      new Octree(new THREE.Vector3(x - offset, y + offset, z + offset), newSize),
+      new Octree(new THREE.Vector3(x + offset, y + offset, z + offset), newSize),
+    ];
+    this.divided = true;
+  }
+
+  insert(object) {
+    if (!this.containsPoint(object.position)) return false;
+
+    if (this.objects.length < 8 && !this.divided) {
+      this.objects.push(object);
+      return true;
+    }
+
+    if (!this.divided) this.subdivide();
+
+    for (const child of this.children) {
+      if (child.insert(object)) return true;
+    }
+
+    return false;
+  }
+
+  containsPoint(point) {
+    return (
+      point.x >= this.center.x - this.size / 2 &&
+      point.x < this.center.x + this.size / 2 &&
+      point.y >= this.center.y - this.size / 2 &&
+      point.y < this.center.y + this.size / 2 &&
+      point.z >= this.center.z - this.size / 2 &&
+      point.z < this.center.z + this.size / 2
+    );
+  }
+  intersectsFrustum(frustum) {
+    return frustum.intersectsBox(this.boundingBox);
+  }
+
+  getVisibleOctants(frustum) {
+    let count = 0;
+    if (this.intersectsFrustum(frustum)) {
+      count = 1;
+      if (this.divided) {
+        for (const child of this.children) {
+          count += child.getVisibleOctants(frustum);
+        }
+      }
+    }
+    return count;
+  }
+}
+
+function RandomFBXFiles() {
+  const [files, setFiles] = useState([]);
+  const [boundingBox, setBoundingBox] = useState(null);
+  const [objectCount, setObjectCount] = useState(0);
+  const mountRef = useRef(null);
+  const sceneRef = useRef(null);
+  const rendererRef = useRef(null);
+  const cameraRef = useRef(null);
+  const controlsRef = useRef(null);
+  const cumulativeBoundingBoxRef = useRef(new THREE.Box3());
+  const octreeRef = useRef(null);
+  const octreeVisualizerRef = useRef(null);
+  const [visibleOctants, setVisibleOctants] = useState(0);
+  
+  const raycasterRef = useRef(new THREE.Raycaster());
+  const [frustumCulledCount, setFrustumCulledCount] = useState(0);
+  const [frustumUnculledCount, setFrustumUnculledCount] = useState(0);
+  const [occlusionCulledCount, setOcclusionCulledCount] = useState(0);
+  const [occlusionUnculledCount, setOcclusionUnculledCount] = useState(0);
+  const [totalMeshes, setTotalMeshes] = useState(0);
+  const [totalFiles, setTotalFiles] = useState(0);
+  const mouse = useRef({ x: 0, y: 0 });
+  const isMouseDown = useRef(false);
+  const isPanning = useRef(false);
+  const isZooming = useRef(false);
+  const lastMouseMovement = useRef({ x: 0, y: 0 });
+  const [flySpeed, setFlySpeed] = useState(1); 
+  const [flyrotationSpeed, setflyrotationSpeed] = useState(1); 
+  const [loadingProgress, setLoadingProgress] = useState(0);
+  const [meshOctreeRelations, setMeshOctreeRelations] = useState({});
+  const [nodeGzipRelations, setNodeGzipRelations] = useState({});
+  const [fileSizes, setFileSizes] = useState([]);
+  const [convertedModels, setConvertedModels] = useState([]);
+  const [totalOctants, setTotalOctants] = useState(0);
+
+  useEffect(() => {
+    initScene();
+    return () => {
+      if (rendererRef.current) {
+        rendererRef.current.dispose();
+      }
+    };
+  }, []);
+
+  const initScene = () => {
+    const scene = new THREE.Scene();
+    const camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+    const renderer = new THREE.WebGLRenderer();
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setClearColor(0x00ffff);
+    mountRef.current.appendChild(renderer.domElement);
+
+    // const controls = new OrbitControls(camera, renderer.domElement);
+
+    const ambientLight = new THREE.AmbientLight(0xffffff, 0.5);
+    scene.add(ambientLight);
+
+    const directionalLight = new THREE.DirectionalLight(0xffffff, 0.5);
+    directionalLight.position.set(1, 1, 1);
+    scene.add(directionalLight);
+
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controlsRef.current = controls;
+
+
+    sceneRef.current = scene;
+    cameraRef.current = camera;
+    rendererRef.current = renderer;
+    // controlsRef.current = controls;
+
+    animate();
+  };
+
+  const animate = () => {
+    requestAnimationFrame(animate);
+    if (controlsRef.current) controlsRef.current.update();
+    if (rendererRef.current && sceneRef.current && cameraRef.current) {
+      rendererRef.current.render(sceneRef.current, cameraRef.current);
+      updateCullingStats();
+    }
+  };
+//   useEffect(() => {
+//     enablefycontrols();
+//     return () => {
+//         disableflycontrols();
+//     };
+// }, [flySpeed, flyrotationSpeed]);
+
+ 
+
+  const handleFileChange = async (event) => {
+    const selectedFiles = Array.from(event.target.files);
+    setFiles(selectedFiles);
+    await processFiles(selectedFiles);
+  };
+
+  const processFiles = async (selectedFiles) => {
+    const fbxLoader = new FBXLoader();
+    cumulativeBoundingBoxRef.current.makeEmpty();
+    setTotalFiles(selectedFiles.length); // Set total files count
+    setLoadingProgress(0); // Reset loading progress
+
+    const loadFile = (file,index) => {
+        return new Promise((resolve) => {
+            const reader = new FileReader();
+            reader.onload = (e) => {
+                const arrayBuffer = e.target.result;
+                const blob = new Blob([arrayBuffer], { type: file.type });
+                const objectUrl = URL.createObjectURL(blob);
+
+                fbxLoader.load(
+                    objectUrl,
+                    (object) => {
+                        sceneRef.current.add(object);
+                        const objectBoundingBox = new THREE.Box3().setFromObject(object);
+                        cumulativeBoundingBoxRef.current.union(objectBoundingBox);
+
+                        let newObjectCount = 0;
+                        object.traverse((child) => {
+                            if (child.isMesh) {
+                                child.geometry.boundsTree = new MeshBVH(child.geometry);
+                                const bvhHelper = new MeshBVHHelper(child);
+                                sceneRef.current.add(bvhHelper);
+                                bvhHelper.visible = false;
+                                newObjectCount += 1;
+                            }
+                        });
+
+                        setObjectCount((prevCount) => prevCount + newObjectCount);
+                        setLoadingProgress(((index + 1) / selectedFiles.length) * 100); // Update loading progress
+                        URL.revokeObjectURL(objectUrl);
+                        resolve();
+                    },
+                    undefined,
+                    (error) => {
+                        console.error('Error loading FBX file:', error);
+                        resolve();
+                    }
+                );
+            };
+            reader.readAsArrayBuffer(file);
+        });
+    };
+
+    await Promise.all(selectedFiles.map(loadFile));
+
+    setBoundingBox(cumulativeBoundingBoxRef.current);
+    createBoxInScene();
+    createOctree();
+};
+
+  const createBoxInScene = () => {
+    if (sceneRef.current) {
+      const existingBox = sceneRef.current.getObjectByName('boundingBox');
+      if (existingBox) sceneRef.current.remove(existingBox);
+
+      const box = cumulativeBoundingBoxRef.current;
+      if (box.isEmpty()) {
+        console.log('Bounding box is empty');
+        return;
+      }
+
+      const center = box.getCenter(new THREE.Vector3());
+      const size = box.getSize(new THREE.Vector3());
+      console.log(center)
+      const geometry = new THREE.BoxGeometry(size.x, size.y, size.z);
+      const material = new THREE.MeshBasicMaterial({ color: 0x00ff00, wireframe: true });
+      const mesh = new THREE.Mesh(geometry, material);
+      mesh.name = 'boundingBox';
+      mesh.position.copy(center);
+      // sceneRef.current.add(mesh);
+
+      const maxDim = Math.max(size.x, size.y, size.z);
+      const fov = cameraRef.current.fov * (Math.PI / 180);
+      let cameraZ = Math.abs(maxDim / 2 / Math.tan(fov / 2));
+      cameraZ *= 1.5;
+
+      cameraRef.current.position.set(center.x, center.y, center.z + cameraZ);
+      cameraRef.current.lookAt(center);
+      // controlsRef.current.target.copy(center);
+      // controlsRef.current.update();
+    }
+  };
+
+  // const createOctree = () => {
+  //   if (sceneRef.current && cumulativeBoundingBoxRef.current) {
+  //     const box = cumulativeBoundingBoxRef.current;
+  //     const center = box.getCenter(new THREE.Vector3());
+  //     const size = box.getSize(new THREE.Vector3());
+  //     const maxSize = Math.max(size.x, size.y, size.z);
+    
+  //     octreeRef.current = new Octree(center, maxSize);
+
+  //     sceneRef.current.traverse((child) => {
+  //       if (child.isMesh) {
+  //         octreeRef.current.insert(child);
+  //       }
+  //     });
+
+  //     if (octreeVisualizerRef.current) {
+  //       sceneRef.current.remove(octreeVisualizerRef.current);
+  //     }
+  //     octreeVisualizerRef.current = visualizeOctree(octreeRef.current);
+  //     // sceneRef.current.add(octreeVisualizerRef.current);
+  //   }
+  // };
+
+  // const visualizeOctree = (octree, depth = 0) => {
+  //   const group = new THREE.Group();
+    
+  //   // Create a box for this octree node
+  //   const geometry = new THREE.BoxGeometry(octree.size, octree.size, octree.size);
+    
+  //   // Change the color based on the depth
+  //   const color = new THREE.Color();
+  //   color.setHSL(depth / 10, 1.0, 0.5); // Gradually change color by depth
+    
+  //   const material = new THREE.MeshBasicMaterial({ 
+  //     color: color,
+  //     transparent: true,
+  //     opacity: 0.4, // Make it semi-transparent
+  //     wireframe: true
+  //   });
+  //   const mesh = new THREE.Mesh(geometry, material);
+  //   mesh.position.copy(octree.center);
+  //   group.add(mesh);
+  
+  //   // Add a small sphere at the center of the node (optional)
+  //   const sphereGeometry = new THREE.SphereGeometry(octree.size * 0.02);
+  //   const sphereMaterial = new THREE.MeshBasicMaterial({ color: 0xffffff });
+  //   const sphere = new THREE.Mesh(sphereGeometry, sphereMaterial);
+  //   sphere.position.copy(octree.center);
+  //   group.add(sphere);
+  
+  //   // Recursively visualize children
+  //   if (octree.divided) {
+  //     octree.children.forEach(child => {
+  //       group.add(visualizeOctree(child, depth + 1));
+  //     });
+  //   }
+  
+  //   return group;
+  // };
+  
+  const updateCullingStats = () => {
+    const camera = cameraRef.current;
+    const frustum = new THREE.Frustum();
+    const cameraViewProjectionMatrix = new THREE.Matrix4();
+    
+    // Update camera matrices
+    camera.updateMatrixWorld();
+    cameraViewProjectionMatrix.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
+    frustum.setFromProjectionMatrix(cameraViewProjectionMatrix);
+  
+    let frustumCulled = 0;
+    let frustumUnculled = 0;
+    let occlusionCulled = 0;
+    let occlusionUnculled = 0;
+    const objectsToCheck = [];
+    
+    // Traverse scene and perform frustum culling
+    sceneRef.current.traverse((child) => {
+      if (child.isMesh) {
+        const boundingBox = new THREE.Box3().setFromObject(child);
+        
+        // Frustum culling
+        if (frustum.intersectsBox(boundingBox)) {
+          frustumUnculled++;
+          objectsToCheck.push(child); // Save for occlusion check
+        } else {
+          frustumCulled++;
+          child.visible = false; // Hide objects outside the frustum
+        }
+      }
+    });
+  
+    // Perform raycasting for occlusion culling
+    const raycaster = new THREE.Raycaster();
+    objectsToCheck.forEach((obj) => {
+      // Compute the bounding sphere for more accurate raycasting
+      obj.geometry.computeBoundingSphere();
+      const boundingSphere = obj.geometry.boundingSphere;
+      const direction = boundingSphere.center.clone().sub(camera.position).normalize();
+      
+      // Set ray from the camera to the object's bounding sphere center
+      raycaster.set(camera.position, direction);
+      
+      // Perform raycasting against all objects within the frustum
+      const intersects = raycaster.intersectObjects(objectsToCheck, true);
+      
+      if (intersects.length > 0) {
+        // Check if any object is blocking the current object
+        const closestIntersect = intersects[0];
+        
+        if (closestIntersect.object !== obj && closestIntersect.distance < boundingSphere.center.distanceTo(camera.position)) {
+          // An object is blocking this one, mark it occluded
+          obj.visible = false;
+          occlusionCulled++;
+        } else {
+          // No object blocking this one, mark it visible
+          obj.visible = true;
+          occlusionUnculled++;
+        }
+      } else {
+        // No intersections, make the object visible
+        obj.visible = true;
+        occlusionUnculled++;
+      }
+    });
+  
+    // Update stats
+    setFrustumCulledCount(frustumCulled);
+    setFrustumUnculledCount(frustumUnculled);
+    setOcclusionCulledCount(occlusionCulled);
+    setOcclusionUnculledCount(occlusionUnculled);
+    setTotalMeshes(frustumCulled + frustumUnculled); // Total meshes
+  };
+  
+  const handleFileUpload = async (event) => {
+    const files = event.target.files;
+    setFiles(files);
+    if (!files.length) return;
+
+    while(sceneRef.current.children.length > 0){ 
+      sceneRef.current.remove(sceneRef.current.children[0]); 
+    }
+
+    const loader = new FBXLoader();
+    let cumulativeBox = new THREE.Box3();
+    let hasItems = false;
+    const meshBoundingBoxes = [];
+    const meshFileRelations = {};
+    const serializedGeometries = {};
+    const newFileSizes = [];
+    const newConvertedModels = [];
+
+    for (const file of files) {
+      try {
+        const fbxObject = await loadFile(file, loader);
+        const glbData = await convertToGLB(fbxObject);
+        const glbObject = await loadGLB(glbData);
+
+        glbObject.traverse((child) => {
+          if (child.isMesh) {
+            const box = new THREE.Box3().setFromObject(child);
+            meshBoundingBoxes.push(box);
+            meshFileRelations[box.uuid] = file.name;
+            serializedGeometries[box.uuid] = serializeGeometry(child.geometry);
+            
+            if (hasItems) {
+              cumulativeBox.union(box);
+            } else {
+              cumulativeBox.copy(box);
+              hasItems = true;
+            }
+          }
+        });
+
+        const glbBlob = new Blob([glbData], { type: "model/gltf-binary" });
+        newFileSizes.push({ name: file.name, fbxSize: file.size, glbSize: glbBlob.size });
+        newConvertedModels.push({ fileName: file.name.replace(".fbx", ".glb"), data: glbBlob });
+      } catch (error) {
+        console.error('Error processing loaded object:', error);
+      }
+    }
+
+    if (hasItems) {
+      updateBoundingBox(cumulativeBox);
+      const octree = createOctree(cumulativeBox, meshBoundingBoxes);
+      octreeRef.current = octree;
+      positionCamera(cumulativeBox);
+      createBoundingBoxMeshes(meshBoundingBoxes);
+      createCumulativeBoundingBoxMesh(cumulativeBox);
+      visualizeOctree(octree);
+      const relations = relateMeshesToOctree(octree, meshBoundingBoxes);
+      setMeshOctreeRelations(relations);
+      await createAndStoreGzipFiles(octree, meshFileRelations, serializedGeometries);
+
+      // updateFrustum();
+      // setVisibleOctants(visibleCount);
+    }
+
+    setFileSizes(newFileSizes);
+    setConvertedModels(newConvertedModels);
+  };
+
+  const loadFile = (file, loader) => {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = (e) => {
+        const arrayBuffer = e.target.result;
+        const blob = new Blob([arrayBuffer], { type: file.type });
+        const objectUrl = URL.createObjectURL(blob);
+
+        loader.load(
+          objectUrl,
+          (object) => resolve(object),
+          (xhr) => console.log((xhr.loaded / xhr.total * 100) + '% loaded'),
+          (error) => reject(error)
+        );
+      };
+      reader.readAsArrayBuffer(file);
+    });
+  };
+
+  const convertToGLB = (fbxObject) => {
+    return new Promise((resolve, reject) => {
+      fbxObject.traverse((child) => {
+        if (child.isMesh) {
+          child.material = new THREE.MeshBasicMaterial({ color: 0xcccccc });
+          if (child.geometry.attributes.color) {
+            child.geometry.deleteAttribute("color");
+          }
+          if (child.geometry.attributes.uv) {
+            child.geometry.deleteAttribute("uv");
+          }
+          if (child.geometry.attributes.normal) {
+            child.geometry.deleteAttribute("normal");
+          }
+        }
+      });
+  
+      const exporter = new GLTFExporter();
+      exporter.parse(
+        fbxObject,
+        (result) => resolve(result),
+        (error) => reject(error),
+        { binary: true }
+      );
+    });
+  };
+
+  const loadGLB = (glbData) => {
+    return new Promise((resolve, reject) => {
+      const loader = new GLTFLoader();
+      loader.parse(glbData, "", (gltf) => resolve(gltf.scene), reject);
+    });
+  };
+
+  const serializeGeometry = (geometry) => {
+    return {
+      vertices: Array.from(geometry.attributes.position.array),
+      normals: geometry.attributes.normal ? Array.from(geometry.attributes.normal.array) : null,
+      uvs: geometry.attributes.uv ? Array.from(geometry.attributes.uv.array) : null,
+      indices: geometry.index ? Array.from(geometry.index.array) : null,
+    };
+  };
+
+  const createOctree = (box, meshBoundingBoxes) => {
+    const center = new THREE.Vector3();
+    box.getCenter(center);
+    const size = Math.max(box.max.x - box.min.x, box.max.y - box.min.y, box.max.z - box.min.z);
+    const octree = new Octree(center, size);
+
+    meshBoundingBoxes.forEach(meshBox => {
+      const meshCenter = new THREE.Vector3();
+      meshBox.getCenter(meshCenter);
+      octree.insert({ position: meshCenter, boxUuid: meshBox.uuid });
+    });
+
+    console.log(`Added ${meshBoundingBoxes.length} objects to the Octree`);
+    
+    const countOctants = (node) => {
+      let count = 1;
+      if (node.divided) {
+        node.children.forEach(child => {
+          count += countOctants(child);
+        });
+      }
+      return count;
+    };
+    setTotalOctants(countOctants(octree));
+
+    return octree;
+  };
+  const relateMeshesToOctree = (octree, meshBoundingBoxes) => {
+    const relations = {};
+
+    const traverse = (node, depth = 0) => {
+      node.objects.forEach(obj => {
+        if (!relations[obj.boxUuid]) {
+          relations[obj.boxUuid] = [];
+        }
+        relations[obj.boxUuid].push({ node, depth });
+      });
+
+      if (node.divided) {
+        node.children.forEach(child => traverse(child, depth + 1));
+      }
+    };
+
+    traverse(octree);
+    return relations;
+  };
+
+  const createAndStoreGzipFiles = async (octree, meshFileRelations, serializedGeometries) => {
+    const db = await openIndexedDB();
+    const nodeGzipRelations = {};
+
+    const createGzipForNode = async (node, depth) => {
+      const nodeId = `node_${depth}_${node.center.toArray().join('_')}`;
+      const nodeData = {};
+
+      node.objects.forEach(obj => {
+        const fileName = meshFileRelations[obj.boxUuid];
+        if (fileName) {
+          const geometryJson = JSON.stringify(serializedGeometries[obj.boxUuid]);
+          nodeData[fileName] = geometryJson;
+        }
+      });
+
+      const jsonString = JSON.stringify(nodeData);
+      const gzippedData = pako.gzip(jsonString);
+      const gzipBlob = new Blob([gzippedData], { type: 'application/gzip' });
+
+      await storeGzipInIndexedDB(db, nodeId, gzipBlob);
+
+      nodeGzipRelations[nodeId] = { node, depth };
+
+      if (node.divided) {
+        await Promise.all(node.children.map(child => createGzipForNode(child, depth + 1)));
+      }
+    };
+
+    await createGzipForNode(octree, 0);
+    setNodeGzipRelations(nodeGzipRelations);
+    db.close();
+  };
+
+  const openIndexedDB = () => {
+    return new Promise((resolve, reject) => {
+      const request = indexedDB.open('OctreeGzipDB', 1);
+      request.onerror = () => reject(request.error);
+      request.onsuccess = () => resolve(request.result);
+      request.onupgradeneeded = (event) => {
+        const db = event.target.result;
+        db.createObjectStore('gzips', { keyPath: 'nodeId' });
+      };
+    });
+  };
+
+  const storeGzipInIndexedDB = (db, nodeId, gzipBlob) => {
+    return new Promise((resolve, reject) => {
+      const transaction = db.transaction(['gzips'], 'readwrite');
+      const store = transaction.objectStore('gzips');
+      const request = store.put({ nodeId, gzipBlob });
+      request.onerror = () => reject(request.error);
+      request.onsuccess = () => resolve();
+    });
+  };
+
+  const updateBoundingBox = (box) => {
+    const center = new THREE.Vector3();
+    const size = new THREE.Vector3();
+    box.getCenter(center);
+    box.getSize(size);
+    setBoundingBox({ center, size });
+  };
+
+  const positionCamera = (box) => {
+    const camera = cameraRef.current;
+    const controls = controlsRef.current;
+    const size = new THREE.Vector3();
+    box.getSize(size);
+    const maxDim = Math.max(size.x, size.y, size.z);
+    const fov = camera.fov * (Math.PI / 180);
+    const cameraZ = Math.abs(maxDim / 2 / Math.tan(fov / 2)) * 1.5;
+    const center = new THREE.Vector3();
+    box.getCenter(center);
+
+    camera.position.set(center.x, center.y, center.z + cameraZ);
+    camera.lookAt(center);
+    controls.target.copy(center);
+    controls.update();
+  };
+
+  const createBoundingBoxMeshes = (boxes) => {
+    boxes.forEach((box) => {
+      const mesh = createBoundingBoxMesh(box, 0x00ff00, 0.5);
+      sceneRef.current.add(mesh);
+    });
+  };
+
+  const createCumulativeBoundingBoxMesh = (box) => {
+    const mesh = createBoundingBoxMesh(box, 0xffff00, 1);
+    sceneRef.current.add(mesh);
+  };
+
+  const createBoundingBoxMesh = (box, color, opacity = 1) => {
+    const size = new THREE.Vector3();
+    box.getSize(size);
+
+    const geometry = new THREE.BoxGeometry(1, 1, 1);
+    const material = new THREE.MeshBasicMaterial({ 
+      color: color, 
+      wireframe: true, 
+      transparent: true, 
+      opacity: opacity 
+    });
+    const mesh = new THREE.Mesh(geometry, material);
+
+    const center = box.getCenter(new THREE.Vector3());
+    mesh.position.set(center.x, center.y, center.z);
+    mesh.scale.set(size.x, size.y, size.z);
+
+    return mesh;
+  };
+
+  const visualizeOctree = (octree) => {
+    if (!octree) return;
+
+    const maxDepth = getMaxDepth(octree);
+
+    const visualizeNode = (node, depth = 0) => {
+      const color = getColorForDepth(depth, maxDepth);
+      const mesh = createBoundingBoxMesh(node.boundingBox, color, 0.3);
+      sceneRef.current.add(mesh);
+
+      if (node.divided) {
+        node.children.forEach(child => {
+          visualizeNode(child, depth + 1);
+        });
+      }
+    };
+
+    visualizeNode(octree);
+  };
+
+  const getMaxDepth = (node) => {
+    if (!node.divided) return 0;
+    return 1 + Math.max(...node.children.map(getMaxDepth));
+  };
+
+  const getColorForDepth = (depth, maxDepth) => {
+    const hue = (depth / maxDepth) * 0.8;
+    return new THREE.Color().setHSL(hue, 1, 0.5);
+  };
+
+let continueTranslation = false;
+let continueRotation = false;
+let translationDirection = 0;
+let rotationDirection = 0;
+let translationSpeed = 5; // Initial translation speed
+let rotationSpeed = 0.0001; // Initial rotation speed
+// Define sensitivity constants
+const horizontalSensitivity = 1.1; // Adjust as needed
+const verticalSensitivity = 1.1; // Adjust as needed
+
+// mouse events functions on fly control
+const handleMouseUp = () => {
+  isMouseDown.current = false;
+  isPanning.current = false;
+  isZooming.current = false;    
+  lastMouseMovement.current = { x: 0, y: 0 };
+  continueTranslation = false;
+  continueRotation = false;
+};
+const handleMouseDown = (event) => {
+    const mouseEvent = event.touches ? event.touches[0] : event;
+    if (mouseEvent.button === 0) { // Left mouse button pressed
+      isMouseDown.current = true;
+      mouse.current.x = mouseEvent.clientX;
+      mouse.current.y = mouseEvent.clientY;
+      isZooming.current = true;
+      continueTranslation = true; // Enable automatic translation
+      continueRotation = true; // Enable automatic rotation
+      translationDirection = lastMouseMovement.current.y > 0 ? 1 : -1; // Set translation direction based on last mouse movement
+      rotationDirection = lastMouseMovement.current.x > 0 ? 1 : -1; // Set rotation direction based on last mouse movement
+    } else if (mouseEvent.button === 1) { // Middle mouse button pressed
+      console.log("middlebutton pressed");
+      isPanning.current = true;
+      continueTranslation = true; // Enable automatic translation
+      mouse.current.x = mouseEvent.clientX;
+      mouse.current.y = mouseEvent.clientY;
+    }
+  };
+ 
+  const handleMouseMove = (event) => {
+    event.preventDefault();
+
+    const mouseEvent = event.touches ? event.touches[0] : event;
+    if (!isMouseDown.current && !isPanning.current && !isZooming.current) return;
+
+    const movementX = mouseEvent.clientX - mouse.current.x;
+    const movementY = mouseEvent.clientY - mouse.current.y;
+
+    lastMouseMovement.current = { x: movementX, y: movementY };
+    if (isMouseDown.current) { // Left mouse button clicked
+      const isHorizontal = Math.abs(movementX) > Math.abs(movementY);
+      if (isHorizontal) { // Horizontal movement, rotate around Y axis
+        continueCameraMovement(); 
+      } else { // Vertical movement, forward/backward
+        continueCameraMovement(); // Adjust with factors
+      }
+    } else if (isPanning.current) { // Middle mouse button clicked
+      continueCameraMovement(movementX, movementY); // Adjust with factors
+    }
+
+    mouse.current.x = mouseEvent.clientX;
+    mouse.current.y = mouseEvent.clientY;
+  };
+
+  const continueCameraMovement = () => {
+    const adjustedTranslationSpeed = flySpeed * translationSpeed;
+    if (isMouseDown.current && (continueTranslation || continueRotation)) {
+      requestAnimationFrame(continueCameraMovement);
+      const movementX = lastMouseMovement.current.x;
+      const movementY = lastMouseMovement.current.y;
+      const tileSizeFactor = 10; // Implement this function to calculate the factor based on tile size
+      const isHorizontal = Math.abs(movementX) > Math.abs(movementY);
+      if (isHorizontal) {
+        const rotationAngle = -movementX * rotationSpeed * horizontalSensitivity * flyrotationSpeed * tileSizeFactor;
+
+        // Get the camera's up vector
+        let cameraUp = cameraRef.current.up.clone().normalize();
+        
+        // Create a quaternion representing the rotation around the camera's up vector
+        let quaternion = new THREE.Quaternion().setFromAxisAngle(cameraUp, rotationAngle);
+        
+        cameraRef.current.applyQuaternion(quaternion);
+      } else {
+        const zoomSpeed = movementY * 0.01; // Adjust zoom speed based on last recorded mouse movement
+
+        const forwardDirection = new THREE.Vector3(0, 0, 1).applyQuaternion(cameraRef.current.quaternion);
+        // Move the camera forward/backward along its local forward direction
+        cameraRef.current.position.add(forwardDirection.multiplyScalar(zoomSpeed * adjustedTranslationSpeed * tileSizeFactor));
+      }			
+    } else if (isPanning.current && continueTranslation) {
+      requestAnimationFrame(continueCameraMovement);
+      const tileSizeFactor = 0.1;
+      const movementY = lastMouseMovement.current.y;
+      const movementX = lastMouseMovement.current.x;
+      const adjustedHorizontalSensitivity = horizontalSensitivity * tileSizeFactor;
+      const adjustedVerticalSensitivity = verticalSensitivity * tileSizeFactor;
+
+      // Calculate movement speed based on mouse movement and sensitivity
+      const moveSpeedX = movementX * adjustedHorizontalSensitivity;
+      const moveSpeedY = movementY * adjustedVerticalSensitivity;
+      
+      const isHorizontal = Math.abs(movementX) > Math.abs(movementY);
+      const isVertical = Math.abs(movementY) > Math.abs(movementX);
+    
+      if (isHorizontal) {
+        // Move the camera along its local x axis
+        cameraRef.current.translateX(moveSpeedX);
+      } else if (isVertical) {
+        // Move the camera along its local y axis
+        cameraRef.current.translateY(-moveSpeedY);
+      }
+    }
+  };
+
+    // enablefycontrols
+    const enablefycontrols=()=>{
+    
+        document.addEventListener('mousedown', handleMouseDown);
+        document.addEventListener('mouseup', handleMouseUp);
+        document.addEventListener('mousemove', handleMouseMove);
+        
+        // document.addEventListener('wheel', handleWheel);
+    }
+    // disableflycontrols
+    const disableflycontrols=()=>{
+        document.removeEventListener('mousedown', handleMouseDown);
+        document.removeEventListener('mouseup', handleMouseUp);
+        document.removeEventListener('mousemove', handleMouseMove);    
+        // document.removeEventListener('wheel', handleWheel);
+    }
+    const fitView=()=>{
+        const box = cumulativeBoundingBoxRef.current;
+        if (box.isEmpty()) {
+          console.log('Bounding box is empty');
+          return;
+        }
+  
+        const center = box.getCenter(new THREE.Vector3());
+        const size = box.getSize(new THREE.Vector3());
+        const maxDim = Math.max(size.x, size.y, size.z);
+        const fov = cameraRef.current.fov * (Math.PI / 180);
+        let cameraZ = Math.abs(maxDim / 2 / Math.tan(fov / 2));
+        cameraZ *= 1.5;
+  
+        cameraRef.current.position.set(center.x, center.y, center.z + cameraZ);
+        cameraRef.current.lookAt(center);
+    }
+return (
+    // <div >     
+    //     <div ref={mountRef}  style={{width:'100%',height:'100px'}}  />
+    //     <input type="file" multiple onChange={handleFileUpload} accept=".fbx" />
+    //     {/* <LoadingBar progress={loadingProgress} /> */}
+    //     <button onClick={fitView} className='btn'>fitview</button>
+    //     {boundingBox && (
+    //         <div>
+    //             <h3>Cumulative Bounding Box:</h3>
+    //             <p>Min: {JSON.stringify(boundingBox.min)}</p>
+    //             <p>Max: {JSON.stringify(boundingBox.max)}</p>
+    //         </div>
+    //     )}
+    //     <div>
+    //         <h3>Rendering Scope:</h3>
+    //         <p>Total Files: {totalFiles}</p>
+    //         <p>Total Meshes: {totalMeshes}</p>
+    //         <p>Frustum Culled Count: {frustumCulledCount}</p>
+    //         <p>Frustum Unculled Count: {frustumUnculledCount}</p>
+    //         <p>Occlusion Culled Count: {occlusionCulledCount}</p>
+    //         <p>Occlusion Unculled Count: {occlusionUnculledCount}</p>
+    //     </div>
+       
+    // </div>
+    <div>
+    <h1>FBX to GLB Converter with Octree Visualization</h1>
+    <input type="file" accept=".fbx" multiple onChange={handleFileUpload} />
+    {/* <button onClick={saveConvertedModels}>Save Converted Models</button> */}
+    
+    {boundingBox && (
+      <div>
+         <button onClick={fitView} className='btn'>fitview</button>
+        <p>Cumulative Center: {`x: ${boundingBox.center.x.toFixed(2)}, y: ${boundingBox.center.y.toFixed(2)}, z: ${boundingBox.center.z.toFixed(2)}`}</p>
+        <p>Cumulative Size: {`x: ${boundingBox.size.x.toFixed(2)}, y: ${boundingBox.size.y.toFixed(2)}, z: ${boundingBox.size.z.toFixed(2)}`}</p>
+        <p>Visible Octants: {visibleOctants}</p>
+        <p>Total Octants: {totalOctants}</p>
+        <p>Octants Outside Frustum: {totalOctants - visibleOctants}</p>
+        <p>Frustum Culled: {frustumCulledCount}</p>
+        <p>Frustum Unculled: {frustumUnculledCount}</p>
+        <p>Occlusion Culled: {occlusionCulledCount}</p>
+        <p>Occlusion Unculled: {occlusionUnculledCount}</p>
+        <p>Total Meshes: {totalMeshes}</p>
+      </div>
+    )}
+    <div ref={mountRef} style={{ width: '100vw', height: '100vh' }} />
+    <div>
+      {fileSizes.length > 0 && (
+        <table>
+          <thead>
+            <tr>
+              <th>File Name</th>
+              <th>FBX Size</th>
+              <th>GLB Size</th>
+            </tr>
+          </thead>
+          <tbody>
+            {fileSizes.map(({ name, fbxSize, glbSize }) => (
+              <tr key={name}>
+                <td>{name}</td>
+                <td>{(fbxSize / 1024 / 1024).toFixed(2)} MB</td>
+                <td>{(glbSize / 1024 / 1024).toFixed(2)} MB</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
+    </div>
+  </div>
+);
+
+}
+
+export default RandomFBXFiles;
