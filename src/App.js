@@ -13,8 +13,8 @@ function App() {
       {/* <RandomFBXFiles/> */}
       {/* <IndexedDbRandomFbx/> */}
       {/* <FbxtoGlb/> */}
-      <FbxToGlbLargeScene/>
-      {/* <FbxToGlbFinalLargeScene/> */}
+      {/* <FbxToGlbLargeScene/> */}
+      <FbxToGlbFinalLargeScene/>
      
     </div>
   );

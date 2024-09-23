@@ -8,14 +8,14 @@ import pako from 'pako';
 import { openDB } from "idb";
 
 class Octree {
-    constructor(center, size) {
-      this.center = center;
-      this.size = size;
-      this.children = [];
-      this.objects = [];
-      this.divided = false;
-      this.boundingBox = new THREE.Box3().setFromCenterAndSize(this.center, new THREE.Vector3(this.size, this.size, this.size));
-    }
+  constructor(center, size) {
+    this.center = center;
+    this.size = size;
+    this.children = [];
+    this.objects = [];
+    this.divided = false;
+    this.boundingBox = new THREE.Box3().setFromCenterAndSize(this.center, new THREE.Vector3(this.size, this.size, this.size));
+  }
   
     subdivide() {
       const { x, y, z } = this.center;
@@ -79,6 +79,50 @@ class Octree {
       }
       return count;
     }
+    updateBoundingBoxes() {
+      if (this.divided) {
+        this.children.forEach(child => child.updateBoundingBoxes());
+      } else {
+        this.objects.forEach(obj => {
+          if (obj.geometry && !obj.geometry.boundingBox) {
+            obj.geometry.computeBoundingBox();
+          }
+        });
+      }
+      // Update this node's bounding box
+      this.boundingBox.makeEmpty();
+      this.objects.forEach(obj => {
+        const objectBoundingBox = new THREE.Box3().setFromObject(obj);
+        this.boundingBox.union(objectBoundingBox);
+      });
+      if (this.divided) {
+        this.children.forEach(child => {
+          this.boundingBox.union(child.boundingBox);
+        });
+      }
+    }
+  
+    reinsertObjects() {
+      const allObjects = this.getAllObjects();
+      this.clear();
+      allObjects.forEach(obj => this.insert(obj));
+    }
+  
+    getAllObjects() {
+      let objects = [...this.objects];
+      if (this.divided) {
+        this.children.forEach(child => {
+          objects = objects.concat(child.getAllObjects());
+        });
+      }
+      return objects;
+    }
+  
+    clear() {
+      this.objects = [];
+      this.children = [];
+      this.divided = false;
+    }
   }
 
 function FbxToGlbFinalLargeScene() {
@@ -122,6 +166,11 @@ function FbxToGlbFinalLargeScene() {
     const [meshesOutsideFrustum, setMeshesOutsideFrustum] = useState(0);
     const workerRef = useRef(null);
     const loadedMeshesRef = useRef({});
+    const [processingProgress, setProcessingProgress] = useState(0);
+    const [db, setDb] = useState(null);
+    const [loadingProgress, setLoadingProgress] = useState(0);
+    const [culledMeshes, setCulledMeshes] = useState(0);
+const [unculledMeshes, setUnculledMeshes] = useState(0);
   
     useEffect(() => {
       rendererRef.current.setSize(window.innerWidth, window.innerHeight);
@@ -140,7 +189,6 @@ function FbxToGlbFinalLargeScene() {
       controlsRef.current.enableDamping = true;
       controlsRef.current.dampingFactor = 0.1;
   
-      animate();
   
       const handleResize = () => {
         const width = window.innerWidth;
@@ -226,165 +274,290 @@ function FbxToGlbFinalLargeScene() {
         setProgress(0);
       };
 
-      const processModels = async () => {
-        const loader = new FBXLoader();
-        const objects = [];
-        const newFileSizes = [];
-        const newConvertedModels = [];
-        const newLodModels = [];
-        const newSimplificationStats = [];
+
+  useEffect(() => {
+    const initDB = async () => {
+      const database = await openDB("3DModelsDB", 1, {
+        upgrade(db) {
+          db.createObjectStore("models");
+        },
+      });
+      setDb(database);
+    };
+    initDB();
+  }, []);
+
+  const storeModelInIndexedDB = async (modelName, lodLevel, glbData) => {
+    if (!db) return;
+    const tx = db.transaction("models", "readwrite");
+    const store = tx.objectStore("models");
     
-        cumulativeBoundingBox.current = new THREE.Box3(
-          new THREE.Vector3(Infinity, Infinity, Infinity),
-          new THREE.Vector3(-Infinity, -Infinity, -Infinity)
-        );
+    // Compress the glbData using gzip
+    const compressedData = pako.gzip(glbData);
     
-        for (const file of selectedFiles) {
-          try {
-            const fbxObject = await new Promise((resolve, reject) => {
-              loader.load(
-                URL.createObjectURL(file),
-                (object) => resolve(object),
-                undefined,
-                (error) => reject(error)
-              );
-            });
+    await store.put(compressedData, `${modelName}_${lodLevel}`);
+  };
+
+  const loadModelFromIndexedDB = async (modelName, lodLevel) => {
+    if (!db) return null;
+    const tx = db.transaction("models", "readonly");
+    const store = tx.objectStore("models");
+    const compressedData = await store.get(`${modelName}_${lodLevel}`);
     
-            fbxObject.traverse((child) => {
-              if (child.isMesh) {
-                child.material = new THREE.MeshBasicMaterial({ color: 0xcccccc });
-              }
-            });
-    
-            const lodLevels = [
-              { name: 'LOD1', reduction: 0.25 },
-              { name: 'LOD2', reduction: 0.5 },
-              { name: 'LOD3', reduction: 0.75 }
-            ];
-    
-            const lodVersions = lodLevels.map(level => {
-              const lodObject = fbxObject.clone();
-              const meshStats = [];
-              lodObject.traverse((child) => {
-                if (child.isMesh && child.geometry) {
-                  const result = simplifyGeometry(child.geometry, level.reduction);
-                  child.geometry = result.geometry;
-                  meshStats.push(result);
-                }
-              });
-              newSimplificationStats.push({ fileName: file.name, lodName: level.name, meshStats });
-              return { name: level.name, object: lodObject };
-            });
-    
-            const convertToGLTF = async (object) => {
-              return new Promise((resolve, reject) => {
-                const exporter = new GLTFExporter();
-                exporter.parse(
-                  object,
-                  (result) => {
-                    const output = JSON.stringify(result);
-                    resolve(output);
-                  },
-                  {
-                    binary: false,
-                    includeCustomExtensions: false,
-                    forceIndices: true,
-                    truncateDrawRange: true,
-                  },
-                  (error) => reject(error)
-                );
-              });
-            };
-    
-            const gltfData = await convertToGLTF(fbxObject);
-            const lodGltfData = await Promise.all(lodVersions.map(lod => convertToGLTF(lod.object)));
-    
-            const gltfLoader = new GLTFLoader();
-            const gltfObject = await new Promise((resolve, reject) => {
-              gltfLoader.parse(gltfData, "", (gltf) => resolve(gltf.scene), reject);
-            });
-    
-            objects.push(gltfObject);
-            sceneRef.current.add(gltfObject);
-            const boundingBox = new THREE.Box3().setFromObject(gltfObject);
-            cumulativeBoundingBox.current.union(boundingBox);
-    
-            const gltfBlob = new Blob([gltfData], { type: "application/json" });
-            const lodGltfBlobs = lodGltfData.map(data => new Blob([data], { type: "application/json" }));
-    
-            newFileSizes.push({
-              name: file.name,
-              fbxSize: file.size,
-              gltfSize: gltfBlob.size,
-              lodSizes: lodGltfBlobs.map((blob, index) => ({ name: lodLevels[index].name, size: blob.size }))
-            });
-    
-            newConvertedModels.push({
-              fileName: file.name.replace(".fbx", ".gltf"),
-              data: gltfBlob,
-            });
-    
-           
-    
-          } catch (error) {
-            console.error("Error processing model:", error);
+    // Decompress the data
+    if (compressedData) {
+      return pako.ungzip(compressedData);
+    }
+    return null;
+  };
+
+  const convertToGLB = async (object) => {
+    return new Promise((resolve, reject) => {
+      const exporter = new GLTFExporter();
+      exporter.parse(
+        object,
+        (result) => {
+          const output = result instanceof ArrayBuffer ? result : JSON.stringify(result);
+          resolve(output);
+        },
+        {
+          binary: true,
+          includeCustomExtensions: false,
+          forceIndices: true,
+          truncateDrawRange: true,
+        },
+        (error) => reject(error)
+      );
+    });
+  };
+
+  const processModels = async () => {
+    const loader = new FBXLoader();
+    const newFileSizes = [];
+    const newConvertedModels = [];
+    const newLodModels = [];
+    const newSimplificationStats = [];
+  
+    cumulativeBoundingBox.current = new THREE.Box3(
+      new THREE.Vector3(Infinity, Infinity, Infinity),
+      new THREE.Vector3(-Infinity, -Infinity, -Infinity)
+    );
+  
+    const totalSteps = selectedFiles.length * (4 + 1); // 4 LOD levels + loading to scene
+    let completedSteps = 0;
+  
+    for (const file of selectedFiles) {
+      try {
+        // Check if the model is already in IndexedDB
+        const existingLOD0 = await loadModelFromIndexedDB(file.name, 'LOD0');
+        if (existingLOD0) {
+          console.log(`Model ${file.name} already processed, loading from IndexedDB`);
+          // If the model exists, we'll just load it and update the progress
+          const gltfLoader = new GLTFLoader();
+          const gltfObject = await new Promise((resolve, reject) => {
+            gltfLoader.parse(existingLOD0.buffer, "", (gltf) => resolve(gltf.scene), reject);
+          });
+  
+          sceneRef.current.add(gltfObject);
+          const boundingBox = new THREE.Box3().setFromObject(gltfObject);
+          cumulativeBoundingBox.current.union(boundingBox);
+  
+          // Update progress
+          completedSteps += 5; // 4 LOD levels + loading to scene
+          setProcessingProgress((completedSteps / totalSteps) * 100);
+          continue; // Skip to the next file
+        }
+  
+        const fbxObject = await new Promise((resolve, reject) => {
+          loader.load(
+            URL.createObjectURL(file),
+            (object) => resolve(object),
+            undefined,
+            (error) => reject(error)
+          );
+        });
+  
+        fbxObject.traverse((child) => {
+          if (child.isMesh) {
+            child.material = new THREE.MeshBasicMaterial({ color: 0xcccccc });
           }
-          setSimplificationStats(newSimplificationStats);
-        }
-    
-       // Update state after all processing is done
-       
-       setFileSizes(newFileSizes);
-       setConvertedModels(newConvertedModels);
-       setLodModels(newLodModels);
-    
-      };
-      const simplifyGeometry = (geometry, targetReduction) => {
-        const position = geometry.attributes.position;
-        const normal = geometry.attributes.normal;
-        const uv = geometry.attributes.uv;
-        const originalVertexCount = position.count;
-        
-        if (originalVertexCount <= 100) {
-          return {
-            geometry: geometry.clone(),
-            simplificationApplied: false,
-            originalVertexCount,
-            newVertexCount: originalVertexCount
-          };
-        }
-    
-        const targetVertexCount = Math.max(4, Math.floor(originalVertexCount * (1 - targetReduction)));
-        const stride = Math.max(1, Math.floor(originalVertexCount / targetVertexCount));
-    
-        const newPositions = [];
-        const newNormals = [];
-        const newUvs = [];
-        const newIndices = [];
-    
-        for (let i = 0; i < position.count; i += stride) {
-          newPositions.push(position.getX(i), position.getY(i), position.getZ(i));
-          if (normal) newNormals.push(normal.getX(i), normal.getY(i), normal.getZ(i));
-          if (uv) newUvs.push(uv.getX(i), uv.getY(i));
-        }
-    
-        for (let i = 0; i < newPositions.length / 3 - 1; i++) {
-          newIndices.push(i, i + 1);
-        }
-    
-        const newGeometry = new THREE.BufferGeometry();
-        newGeometry.setAttribute('position', new THREE.Float32BufferAttribute(newPositions, 3));
-        if (normal) newGeometry.setAttribute('normal', new THREE.Float32BufferAttribute(newNormals, 3));
-        if (uv) newGeometry.setAttribute('uv', new THREE.Float32BufferAttribute(newUvs, 2));
-        newGeometry.setIndex(newIndices);
-    
-        return {
-          geometry: newGeometry,
-          simplificationApplied: true,
-          originalVertexCount,
-          newVertexCount: newPositions.length / 3
+        });
+  
+        const lodLevels = [
+          { name: 'LOD0', reduction: 0 },
+          { name: 'LOD1', reduction: 0.25 },
+          { name: 'LOD2', reduction: 0.5 },
+          { name: 'LOD3', reduction: 0.75 }
+        ];
+        const modelFileSizes = {
+          name: file.name,
+          fbxSize: file.size,
+          lodSizes: []
         };
-      };
+  
+        const lodVersions = lodLevels.map(level => {
+          const lodObject = fbxObject.clone();
+          const meshStats = [];
+          lodObject.traverse((child) => {
+            if (child.isMesh && child.geometry) {
+              const result = simplifyGeometry(child.geometry, level.reduction);
+              child.geometry = result.geometry;
+              meshStats.push(result);
+            }
+          });
+          newSimplificationStats.push({ fileName: file.name, lodName: level.name, meshStats });
+          return { name: level.name, object: lodObject };
+        });
+  
+        for (const lod of lodVersions) {
+          const glbData = await convertToGLB(lod.object);
+          await storeModelInIndexedDB(file.name, lod.name, glbData);
+          
+          const compressedData = pako.gzip(glbData);
+          modelFileSizes.lodSizes.push({
+            name: lod.name,
+            size: compressedData.byteLength
+          });
+  
+          completedSteps++;
+          setProcessingProgress((completedSteps / totalSteps) * 100);
+        }
+        newFileSizes.push(modelFileSizes);
+  
+        // Load and add LOD0 to the scene
+        const lod0Data = await loadModelFromIndexedDB(file.name, 'LOD0');
+        if (lod0Data) {
+          const gltfLoader = new GLTFLoader();
+          const gltfObject = await new Promise((resolve, reject) => {
+            gltfLoader.parse(lod0Data.buffer, "", (gltf) => resolve(gltf.scene), reject);
+          });
+  
+          sceneRef.current.add(gltfObject);
+          const boundingBox = new THREE.Box3().setFromObject(gltfObject);
+          cumulativeBoundingBox.current.union(boundingBox);
+        }
+  
+        completedSteps++;
+        setProcessingProgress((completedSteps / totalSteps) * 100);
+  
+      } catch (error) {
+        console.error("Error processing model:", error);
+      }
+    }
+  
+    setSimplificationStats(newSimplificationStats);
+    setFileSizes(newFileSizes);
+    setConvertedModels(newConvertedModels);
+    setLodModels(newLodModels);
+    initializeOctree();
+  
+    // Reset progress when done
+    setProcessingProgress(0);
+  };
+  const simplifyGeometry = (geometry, targetReduction) => {
+  const originalVertexCount = geometry.attributes.position.count;
+  
+  if (originalVertexCount <= 100) {
+    return {
+      geometry: geometry.clone(),
+      simplificationApplied: false,
+      originalVertexCount,
+      newVertexCount: originalVertexCount
+    };
+  }
+
+  const targetVertexCount = Math.max(4, Math.floor(originalVertexCount * (1 - targetReduction)));
+
+  // Basic decimation
+  const step = Math.ceil(originalVertexCount / targetVertexCount);
+  const newPositions = [];
+  const newNormals = [];
+  const newUvs = [];
+
+  for (let i = 0; i < originalVertexCount; i += step) {
+    newPositions.push(
+      geometry.attributes.position.getX(i),
+      geometry.attributes.position.getY(i),
+      geometry.attributes.position.getZ(i)
+    );
+
+    if (geometry.attributes.normal) {
+      newNormals.push(
+        geometry.attributes.normal.getX(i),
+        geometry.attributes.normal.getY(i),
+        geometry.attributes.normal.getZ(i)
+      );
+    }
+
+    if (geometry.attributes.uv) {
+      newUvs.push(
+        geometry.attributes.uv.getX(i),
+        geometry.attributes.uv.getY(i)
+      );
+    }
+  }
+
+  const newGeometry = new THREE.BufferGeometry();
+  newGeometry.setAttribute('position', new THREE.Float32BufferAttribute(newPositions, 3));
+  
+  if (newNormals.length > 0) {
+    newGeometry.setAttribute('normal', new THREE.Float32BufferAttribute(newNormals, 3));
+  }
+  
+  if (newUvs.length > 0) {
+    newGeometry.setAttribute('uv', new THREE.Float32BufferAttribute(newUvs, 2));
+  }
+
+  return {
+    geometry: newGeometry,
+    simplificationApplied: true,
+    originalVertexCount,
+    newVertexCount: newGeometry.attributes.position.count
+  };
+};
+
+const updateLODs = useCallback(() => {
+  const camera = cameraRef.current;
+  let sceneChanged = false;
+
+  sceneRef.current.traverse(async (object) => {
+    if (object instanceof THREE.Mesh) {
+      const distance = camera.position.distanceTo(object.position);
+      let lodLevel;
+      if (distance > 100) lodLevel = 'LOD3';
+      else if (distance > 50) lodLevel = 'LOD2';
+      else if (distance > 25) lodLevel = 'LOD1';
+      else lodLevel = 'LOD0';
+
+      const modelName = object.name.split('_')[0];
+      const currentLOD = object.name.split('_')[1];
+
+      if (lodLevel !== currentLOD) {
+        const newLODData = await loadModelFromIndexedDB(modelName, lodLevel);
+        if (newLODData) {
+          const gltfLoader = new GLTFLoader();
+          const newObject = await new Promise((resolve, reject) => {
+            gltfLoader.parse(newLODData, "", (gltf) => resolve(gltf.scene), reject);
+          });
+          newObject.position.copy(object.position);
+          newObject.rotation.copy(object.rotation);
+          newObject.scale.copy(object.scale);
+          newObject.name = `${modelName}_${lodLevel}`;
+          sceneRef.current.remove(object);
+          sceneRef.current.add(newObject);
+          sceneChanged = true;
+        }
+      }
+    }
+  });
+
+  if (sceneChanged) {
+    updateOctree();
+  }
+}, []);
+
+
+    
       const saveConvertedModels = async () => {
         if (!saveDirectory) {
           alert("Please select a save directory first.");
@@ -437,13 +610,6 @@ function FbxToGlbFinalLargeScene() {
         );
       };
     
-      const animate = () => {
-        requestAnimationFrame(animate);
-        if (isVisible) {
-          controlsRef.current.update();
-          rendererRef.current.render(sceneRef.current, cameraRef.current);
-        }
-      };
     
       const toggleVisibility = (visible) => {
         setIsVisible(visible);
@@ -468,6 +634,226 @@ function FbxToGlbFinalLargeScene() {
         controlsRef.current.target.copy(center);
         controlsRef.current.update();
       };
+
+      const loadAllModelsToScene = async () => {
+    if (!db) {
+      alert("Database not initialized. Please wait and try again.");
+      return;
+    }
+  
+    // Clear existing scene
+    while(sceneRef.current.children.length > 0){ 
+      sceneRef.current.remove(sceneRef.current.children[0]); 
+    }
+  
+    const tx = db.transaction("models", "readonly");
+    const store = tx.objectStore("models");
+    const keys = await store.getAllKeys();
+    const gltfLoader = new GLTFLoader();
+  
+    // Reset the cumulative bounding box
+    cumulativeBoundingBox.current = new THREE.Box3();
+  
+    const totalModels = keys.length;
+    let loadedModels = 0;
+
+    const loadPromises = keys.map(async (key) => {
+      const compressedData = await store.get(key);
+      try {
+        const glbData = pako.ungzip(compressedData);
+        const gltfObject = await new Promise((resolve, reject) => {
+          gltfLoader.parse(glbData.buffer, "", (gltf) => resolve(gltf.scene), reject);
+        });
+        
+        gltfObject.name = key;
+        sceneRef.current.add(gltfObject);
+  
+        const boundingBox = new THREE.Box3().setFromObject(gltfObject);
+        cumulativeBoundingBox.current.union(boundingBox);
+
+        loadedModels++;
+        setLoadingProgress((loadedModels / totalModels) * 100);
+      } catch (error) {
+        console.error("Error loading model from IndexedDB:", error);
+      }
+    });
+  
+    // Wait for all models to be loaded before closing the transaction
+    await Promise.all(loadPromises);
+  
+    // Ensure the transaction is completed
+    await tx.done;
+  
+    resetCameraView();
+    initializeOctree();
+
+    // Reset progress when done
+    setLoadingProgress(0);
+  };
+    
+      const initializeOctree = () => {
+        const scene = sceneRef.current;
+        const boundingBox = new THREE.Box3().setFromObject(scene);
+        const center = new THREE.Vector3();
+        boundingBox.getCenter(center);
+        const size = boundingBox.getSize(new THREE.Vector3()).length();
+        const newOctree = new Octree(center, size * 2);  // Use size * 2 to ensure it encompasses the entire scene
+      
+        scene.traverse((object) => {
+          if (object instanceof THREE.Mesh) {
+            newOctree.insert(object);
+          }
+        });
+      
+        newOctree.updateBoundingBoxes();
+        setOctree(newOctree);
+      };
+      
+      // Call this function whenever the scene changes significantly
+      const updateOctree = () => {
+        if (octree) {
+          octree.reinsertObjects();
+          octree.updateBoundingBoxes();
+        }
+      };
+    
+      const updateVisibleMeshes = useCallback(() => {
+        if (!octree || !cameraRef.current) return;
+    
+        const frustum = new THREE.Frustum();
+        const matrix = new THREE.Matrix4().multiplyMatrices(
+          cameraRef.current.projectionMatrix,
+          cameraRef.current.matrixWorldInverse
+        );
+        frustum.setFromProjectionMatrix(matrix);
+    
+        let inFrustum = 0;
+        let outsideFrustum = 0;
+    
+        sceneRef.current.traverse((object) => {
+          if (object instanceof THREE.Mesh) {
+            const meshBoundingBox = new THREE.Box3().setFromObject(object);
+            if (frustum.intersectsBox(meshBoundingBox)) {
+              object.visible = true;
+              inFrustum++;
+            } else {
+              object.visible = false;
+              outsideFrustum++;
+            }
+          }
+        });
+    
+        setMeshesInFrustum(inFrustum);
+        setMeshesOutsideFrustum(outsideFrustum);
+      }, [octree]);
+
+      const performOcclusionCulling = useCallback(() => {
+        if (!octree || !cameraRef.current) return;
+      
+        const frustum = new THREE.Frustum();
+        const matrix = new THREE.Matrix4().multiplyMatrices(
+          cameraRef.current.projectionMatrix,
+          cameraRef.current.matrixWorldInverse
+        );
+        frustum.setFromProjectionMatrix(matrix);
+      
+        let meshesInFrustum = 0;
+        let meshesOutsideFrustum = 0;
+        let culledMeshes = 0;
+        let visibleMeshes = 0;
+      
+        // const raycaster = new THREE.Raycaster();
+        const tempVec = new THREE.Vector3();
+        const meshesInFrustumArray = [];
+      
+        // First pass: Determine which meshes are in the frustum
+        sceneRef.current.traverse((object) => {
+          if (object instanceof THREE.Mesh) {
+            const meshBoundingBox = new THREE.Box3().setFromObject(object);
+            if (frustum.intersectsBox(meshBoundingBox)) {
+              meshesInFrustumArray.push(object);
+              meshesInFrustum++;
+              object.visible = true; // Temporarily set all frustum meshes to visible
+            } else {
+              object.visible = false;
+              meshesOutsideFrustum++;
+            }
+          }
+        });
+      
+        // Second pass: Occlusion culling on meshes within frustum
+        // for (const mesh of meshesInFrustumArray) {
+        //   mesh.getWorldPosition(tempVec);
+        //   const direction = tempVec.sub(cameraRef.current.position).normalize();
+        //   raycaster.set(cameraRef.current.position, direction);
+          
+        //   const intersects = raycaster.intersectObjects(meshesInFrustumArray, true);
+        //   if (intersects.length > 0 && intersects[0].object !== mesh) {
+        //     mesh.visible = false;
+        //     culledMeshes++;
+        //   } else {
+        //     visibleMeshes++;
+        //   }
+        // }
+
+         // Perform raycasting for occlusion culling
+    const raycaster = new THREE.Raycaster();
+    meshesInFrustumArray.forEach((obj) => {
+      // Compute the bounding sphere for more accurate raycasting
+      obj.geometry.computeBoundingSphere();
+      const boundingSphere = obj.geometry.boundingSphere;
+      const direction = boundingSphere.center.clone().sub(cameraRef.current.position).normalize();
+      
+      // Set ray from the camera to the object's bounding sphere center
+      raycaster.set(cameraRef.current.position, direction);
+      
+      // Perform raycasting against all objects within the frustum
+      const intersects = raycaster.intersectObjects(meshesInFrustumArray, true);
+      
+      if (intersects.length > 0) {
+        // Check if any object is blocking the current object
+        const closestIntersect = intersects[0];
+        
+        if (closestIntersect.object !== obj && closestIntersect.distance < boundingSphere.center.distanceTo(cameraRef.current.position)) {
+          // An object is blocking this one, mark it occluded
+          obj.visible = false;
+          culledMeshes++;
+        } else {
+          // No object blocking this one, mark it visible
+          obj.visible = true;
+          visibleMeshes++;
+        }
+      }
+      //  else {
+      //   // No intersections, make the object visible
+      //   obj.visible = true;
+      //   culledMeshes++;
+      // }
+    });
+      
+        setMeshesInFrustum(meshesInFrustum);
+        setMeshesOutsideFrustum(meshesOutsideFrustum);
+        setCulledMeshes(culledMeshes);
+        setUnculledMeshes(visibleMeshes);
+      }, [octree]);
+
+      const animate = useCallback(() => {
+        requestAnimationFrame(animate);
+        if (isVisible) {
+          controlsRef.current.update();
+          cameraRef.current.updateMatrixWorld();
+          cameraRef.current.updateProjectionMatrix();
+          updateLODs();
+          performOcclusionCulling();
+          rendererRef.current.render(sceneRef.current, cameraRef.current);
+        }
+      }, [isVisible, updateLODs, performOcclusionCulling]);
+
+        useEffect(() => {
+          animate();
+        }, [animate]);
+      
+      
   return (
     <div className="main">
       <div className="canvas-container">
@@ -491,13 +877,43 @@ function FbxToGlbFinalLargeScene() {
             </div>
           </div>
         )}
-         <div className="frustum-info">
+         {processingProgress > 0 && (
+          <div style={{ margin: '10px 0', width: '100%', backgroundColor: '#e0e0e0' }}>
+            <div
+              style={{
+                width: `${processingProgress}%`,
+                backgroundColor: '#76c7c0',
+                height: '10px',
+                transition: 'width 0.2s',
+              }}
+            />
+          </div>
+        )}
+        {loadingProgress > 0 && (
+          <div>
+            <p>Loading models: {loadingProgress.toFixed(2)}% complete</p>
+            <div style={{ margin: '10px 0', width: '100%', backgroundColor: '#e0e0e0' }}>
+              <div
+                style={{
+                  width: `${loadingProgress}%`,
+                  backgroundColor: '#76c7c0',
+                  height: '10px',
+                  transition: 'width 0.2s',
+                }}
+              />
+            </div>
+          </div>
+        )}
+        <div className="frustum-info">
         <h3>Frustum Information</h3>
         <p>Meshes inside frustum: {meshesInFrustum}</p>
         <p>Meshes outside frustum: {meshesOutsideFrustum}</p>
+        <p>Culled meshes: {culledMeshes}</p>
+        <p>Unculled (visible) meshes: {unculledMeshes}</p>
       </div>
         <button onClick={processModels}>Process Models</button>
         <button onClick={saveConvertedModels}>Save Converted Models</button>
+        <button onClick={loadAllModelsToScene}>Load Stored Models to Scene</button>
         <div ref={mountRef} style={{ width: "99%", height: "100vh" }}></div>
       </div>
 
@@ -527,11 +943,12 @@ function FbxToGlbFinalLargeScene() {
       <div className="file-sizes">
         {fileSizes.map((file, index) => (
           <div key={index}>
-            <p>{file.name}</p>
+            <h3>{file.name}</h3>
             <p>FBX size: {(file.fbxSize / 1024 / 1024).toFixed(2)} MB</p>
-            <p>glTF size: {(file.gltfSize / 1024 / 1024).toFixed(2)} MB</p>
-            {file.lodSizes && file.lodSizes.map((lod, lodIndex) => (
-              <p key={lodIndex}>{lod.name} size: {(lod.size / 1024 / 1024).toFixed(2)} MB</p>
+            {file.lodSizes.map((lod, lodIndex) => (
+              <p key={lodIndex}>
+                {lod.name} GLB size: {(lod.size / 1024 / 1024).toFixed(2)} MB
+              </p>
             ))}
           </div>
         ))}

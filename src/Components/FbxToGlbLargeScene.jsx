@@ -613,7 +613,7 @@ function FbxToGlbLargeScene() {
         });
 
         newConvertedModels.push({
-          fileName: file.name.replace(".fbx", ".gltf"),
+          fileName: file.name.replace(".fbx", ".glb"),
           data: gltfBlob,
         });
 
