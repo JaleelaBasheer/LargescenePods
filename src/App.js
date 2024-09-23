@@ -5,6 +5,7 @@ import FbxToGlbLargeScene from './Components/FbxToGlbLargeScene';
 import IndexedDbRandomFbx from './Components/IndexedDbRandomFbx';
 import RandomBoxesScene from './Components/RandomBoxes';
 import RandomFBXFiles from './Components/RandomFBXFiles';
+import TestScene from './Components/TestScene';
 
 function App() {
   return (
@@ -14,7 +15,8 @@ function App() {
       {/* <IndexedDbRandomFbx/> */}
       {/* <FbxtoGlb/> */}
       {/* <FbxToGlbLargeScene/> */}
-      <FbxToGlbFinalLargeScene/>
+      {/* <FbxToGlbFinalLargeScene/> */}
+      <TestScene/>
      
     </div>
   );

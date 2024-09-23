@@ -125,26 +125,16 @@ class Octree {
     }
   }
 
-function FbxToGlbFinalLargeScene() {
+  function FbxToGlbFinalLargeScene() {
     const mountRef = useRef(null);
     const sceneRef = useRef(new THREE.Scene());
-    const cameraRef = useRef(
-      new THREE.PerspectiveCamera(
-        75,
-        window.innerWidth / window.innerHeight,
-        0.1,
-        1000
-      )
-    );
-  
+    const cameraRef = useRef(new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000));
     const rendererRef = useRef(new THREE.WebGLRenderer({ antialias: true }));
     const controlsRef = useRef(null);
-    const cumulativeBoundingBox = useRef(
-      new THREE.Box3(
-        new THREE.Vector3(Infinity, Infinity, Infinity),
-        new THREE.Vector3(-Infinity, -Infinity, -Infinity)
-      )
-    );
+    const cumulativeBoundingBox = useRef(new THREE.Box3(
+      new THREE.Vector3(Infinity, Infinity, Infinity),
+      new THREE.Vector3(-Infinity, -Infinity, -Infinity)
+    ));
   
     const [isVisible, setIsVisible] = useState(true);
     const [fileSizes, setFileSizes] = useState([]);
@@ -154,23 +144,30 @@ function FbxToGlbFinalLargeScene() {
     const [lodModels, setLodModels] = useState([]);
     const [backgroundColor, setBackgroundColor] = useState(0x000000);
     const [simplificationStats, setSimplificationStats] = useState([]);
-    const [boundingBoxData, setBoundingBoxData] = useState({
-      cumulativeBox: null,
-      center: null,
-      size: null,
-    });
+    const [boundingBoxData, setBoundingBoxData] = useState({ cumulativeBox: null, center: null, size: null });
     const [progress, setProgress] = useState(0);
     const [octree, setOctree] = useState(null);
     const [meshRelations, setMeshRelations] = useState({});
     const [meshesInFrustum, setMeshesInFrustum] = useState(0);
     const [meshesOutsideFrustum, setMeshesOutsideFrustum] = useState(0);
-    const workerRef = useRef(null);
-    const loadedMeshesRef = useRef({});
     const [processingProgress, setProcessingProgress] = useState(0);
     const [db, setDb] = useState(null);
     const [loadingProgress, setLoadingProgress] = useState(0);
     const [culledMeshes, setCulledMeshes] = useState(0);
-const [unculledMeshes, setUnculledMeshes] = useState(0);
+    const [unculledMeshes, setUnculledMeshes] = useState(0);
+  
+    const workerRef = useRef(null);
+  
+    useEffect(() => {
+      workerRef.current = new Worker(new URL('./meshLoaderWorker.js', import.meta.url));
+      workerRef.current.onmessage = handleWorkerMessage;
+  
+      return () => {
+        if (workerRef.current) {
+          workerRef.current.terminate();
+        }
+      };
+    }, []);
   
     useEffect(() => {
       rendererRef.current.setSize(window.innerWidth, window.innerHeight);
@@ -182,13 +179,9 @@ const [unculledMeshes, setUnculledMeshes] = useState(0);
       directionalLight.position.set(0, 1, 0);
       sceneRef.current.add(directionalLight);
   
-      controlsRef.current = new OrbitControls(
-        cameraRef.current,
-        rendererRef.current.domElement
-      );
+      controlsRef.current = new OrbitControls(cameraRef.current, rendererRef.current.domElement);
       controlsRef.current.enableDamping = true;
       controlsRef.current.dampingFactor = 0.1;
-  
   
       const handleResize = () => {
         const width = window.innerWidth;
@@ -203,257 +196,238 @@ const [unculledMeshes, setUnculledMeshes] = useState(0);
         mountRef.current.removeChild(rendererRef.current.domElement);
         controlsRef.current.dispose();
         window.removeEventListener("resize", handleResize);
-        // workerRef.current.terminate();
       };
     }, []);
-
+  
     useEffect(() => {
-        rendererRef.current.setClearColor(backgroundColor);
-      }, [backgroundColor]);
-      const selectSaveDirectory = async () => {
-        try {
-          const dirHandle = await window.showDirectoryPicker();
-          setSaveDirectory(dirHandle);
-        } catch (err) {
-          console.error("Error selecting directory:", err);
-        }
-      };
-    
-    
-      const onFileChange = async (event) => {
-        const loader = new FBXLoader();
-        const files = Array.from(event.target.files);
-        
-        const totalFiles = files.length;
-        let cumulativeBox = new THREE.Box3(
-          new THREE.Vector3(Infinity, Infinity, Infinity),
-          new THREE.Vector3(-Infinity, -Infinity, -Infinity)
-        );
-    
-        for (const [index, file] of files.entries()) {
-          try {
-            const fbxObject = await new Promise((resolve, reject) => {
-              loader.load(
-                URL.createObjectURL(file),
-                (object) => resolve(object),
-                undefined,
-                (error) => reject(error)
-              );
-            });
-    
-            const boundingBox = new THREE.Box3().setFromObject(fbxObject);
-            cumulativeBox.union(boundingBox);
-          } catch (error) {
-            console.error("Error loading FBX file:", error);
-          }
-    
-          const progressPercentage = Math.round(((index + 1) / totalFiles) * 100);
-          setProgress(progressPercentage);
-        }
-    
-        const center = cumulativeBox.getCenter(new THREE.Vector3());
-        const size = cumulativeBox.getSize(new THREE.Vector3());
-    
-        setBoundingBoxData({
-          cumulativeBox,
-          center,
-          size,
+      rendererRef.current.setClearColor(backgroundColor);
+    }, [backgroundColor]);
+  
+    useEffect(() => {
+      const initDB = async () => {
+        const database = await openDB("3DModelsDB", 1, {
+          upgrade(db) {
+            db.createObjectStore("models");
+          },
         });
-        
-        const distance = size.length();
-        const fov = cameraRef.current.fov * (Math.PI / 180);
-        let cameraZ = distance / (2 * Math.tan(fov / 2));
-        cameraZ *= 1.5;
-    
-        cameraRef.current.position.set(center.x, center.y, center.z + cameraZ);
-        cameraRef.current.lookAt(center);
-        controlsRef.current.target.copy(center);
-        controlsRef.current.update();
-    
-        setSelectedFiles(files);
-        setProgress(0);
+        setDb(database);
       };
-
-
-  useEffect(() => {
-    const initDB = async () => {
-      const database = await openDB("3DModelsDB", 1, {
-        upgrade(db) {
-          db.createObjectStore("models");
-        },
-      });
-      setDb(database);
-    };
-    initDB();
-  }, []);
-
-  const storeModelInIndexedDB = async (modelName, lodLevel, glbData) => {
-    if (!db) return;
-    const tx = db.transaction("models", "readwrite");
-    const store = tx.objectStore("models");
-    
-    // Compress the glbData using gzip
-    const compressedData = pako.gzip(glbData);
-    
-    await store.put(compressedData, `${modelName}_${lodLevel}`);
-  };
-
-  const loadModelFromIndexedDB = async (modelName, lodLevel) => {
-    if (!db) return null;
-    const tx = db.transaction("models", "readonly");
-    const store = tx.objectStore("models");
-    const compressedData = await store.get(`${modelName}_${lodLevel}`);
-    
-    // Decompress the data
-    if (compressedData) {
-      return pako.ungzip(compressedData);
-    }
-    return null;
-  };
-
-  const convertToGLB = async (object) => {
-    return new Promise((resolve, reject) => {
-      const exporter = new GLTFExporter();
-      exporter.parse(
-        object,
-        (result) => {
-          const output = result instanceof ArrayBuffer ? result : JSON.stringify(result);
-          resolve(output);
-        },
-        {
-          binary: true,
-          includeCustomExtensions: false,
-          forceIndices: true,
-          truncateDrawRange: true,
-        },
-        (error) => reject(error)
-      );
-    });
-  };
-
-  const processModels = async () => {
-    const loader = new FBXLoader();
-    const newFileSizes = [];
-    const newConvertedModels = [];
-    const newLodModels = [];
-    const newSimplificationStats = [];
+      initDB();
+    }, []);
   
-    cumulativeBoundingBox.current = new THREE.Box3(
-      new THREE.Vector3(Infinity, Infinity, Infinity),
-      new THREE.Vector3(-Infinity, -Infinity, -Infinity)
-    );
+    const handleWorkerMessage = useCallback((event) => {
+      const { type, modelName, lodLevel, modelData } = event.data;
+      if (type === 'modelLoaded') {
+        handleModelLoaded(modelName, lodLevel, modelData);
+      } else if (type === 'allModelsLoaded') {
+        finalizeSceneSetup();
+      }
+    }, []);
   
-    const totalSteps = selectedFiles.length * (4 + 1); // 4 LOD levels + loading to scene
-    let completedSteps = 0;
-  
-    for (const file of selectedFiles) {
-      try {
-        // Check if the model is already in IndexedDB
-        const existingLOD0 = await loadModelFromIndexedDB(file.name, 'LOD0');
-        if (existingLOD0) {
-          console.log(`Model ${file.name} already processed, loading from IndexedDB`);
-          // If the model exists, we'll just load it and update the progress
-          const gltfLoader = new GLTFLoader();
-          const gltfObject = await new Promise((resolve, reject) => {
-            gltfLoader.parse(existingLOD0.buffer, "", (gltf) => resolve(gltf.scene), reject);
-          });
-  
+    const handleModelLoaded = useCallback((modelName, lodLevel, modelData) => {
+      if (modelData) {
+        const gltfLoader = new GLTFLoader();
+        gltfLoader.parse(modelData.buffer, "", (gltf) => {
+          const gltfObject = gltf.scene;
+          gltfObject.name = `${modelName}_${lodLevel}`;
           sceneRef.current.add(gltfObject);
           const boundingBox = new THREE.Box3().setFromObject(gltfObject);
           cumulativeBoundingBox.current.union(boundingBox);
+        }, console.error);
+      }
+    }, []);
   
-          // Update progress
-          completedSteps += 5; // 4 LOD levels + loading to scene
-          setProcessingProgress((completedSteps / totalSteps) * 100);
-          continue; // Skip to the next file
+    const finalizeSceneSetup = useCallback(() => {
+      resetCameraView();
+      initializeOctree();
+      setLoadingProgress(0);
+    }, []);
+  
+    const selectSaveDirectory = async () => {
+      try {
+        const dirHandle = await window.showDirectoryPicker();
+        setSaveDirectory(dirHandle);
+      } catch (err) {
+        console.error("Error selecting directory:", err);
+      }
+    };
+  
+    const onFileChange = async (event) => {
+      const loader = new FBXLoader();
+      const files = Array.from(event.target.files);
+      
+      const totalFiles = files.length;
+      let cumulativeBox = new THREE.Box3(
+        new THREE.Vector3(Infinity, Infinity, Infinity),
+        new THREE.Vector3(-Infinity, -Infinity, -Infinity)
+      );
+  
+      for (const [index, file] of files.entries()) {
+        try {
+          const fbxObject = await new Promise((resolve, reject) => {
+            loader.load(
+              URL.createObjectURL(file),
+              (object) => resolve(object),
+              undefined,
+              (error) => reject(error)
+            );
+          });
+  
+          const boundingBox = new THREE.Box3().setFromObject(fbxObject);
+          cumulativeBox.union(boundingBox);
+        } catch (error) {
+          console.error("Error loading FBX file:", error);
         }
   
-        const fbxObject = await new Promise((resolve, reject) => {
-          loader.load(
-            URL.createObjectURL(file),
-            (object) => resolve(object),
-            undefined,
-            (error) => reject(error)
-          );
-        });
+        const progressPercentage = Math.round(((index + 1) / totalFiles) * 100);
+        setProgress(progressPercentage);
+      }
   
-        fbxObject.traverse((child) => {
-          if (child.isMesh) {
-            child.material = new THREE.MeshBasicMaterial({ color: 0xcccccc });
-          }
-        });
+      const center = cumulativeBox.getCenter(new THREE.Vector3());
+      const size = cumulativeBox.getSize(new THREE.Vector3());
   
-        const lodLevels = [
-          { name: 'LOD0', reduction: 0 },
-          { name: 'LOD1', reduction: 0.25 },
-          { name: 'LOD2', reduction: 0.5 },
-          { name: 'LOD3', reduction: 0.75 }
-        ];
-        const modelFileSizes = {
-          name: file.name,
-          fbxSize: file.size,
-          lodSizes: []
-        };
+      setBoundingBoxData({
+        cumulativeBox,
+        center,
+        size,
+      });
+      
+      const distance = size.length();
+      const fov = cameraRef.current.fov * (Math.PI / 180);
+      let cameraZ = distance / (2 * Math.tan(fov / 2));
+      cameraZ *= 1.5;
   
-        const lodVersions = lodLevels.map(level => {
-          const lodObject = fbxObject.clone();
-          const meshStats = [];
-          lodObject.traverse((child) => {
-            if (child.isMesh && child.geometry) {
-              const result = simplifyGeometry(child.geometry, level.reduction);
-              child.geometry = result.geometry;
-              meshStats.push(result);
+      cameraRef.current.position.set(center.x, center.y, center.z + cameraZ);
+      cameraRef.current.lookAt(center);
+      controlsRef.current.target.copy(center);
+      controlsRef.current.update();
+  
+      setSelectedFiles(files);
+      setProgress(0);
+    };
+  
+    const storeModelInIndexedDB = async (modelName, lodLevel, glbData) => {
+      if (!db) return;
+      const tx = db.transaction("models", "readwrite");
+      const store = tx.objectStore("models");
+      
+      const compressedData = pako.gzip(glbData);
+      
+      await store.put(compressedData, `${modelName}_${lodLevel}`);
+    };
+  
+    const convertToGLB = async (object) => {
+      return new Promise((resolve, reject) => {
+        const exporter = new GLTFExporter();
+        exporter.parse(
+          object,
+          (result) => {
+            const output = result instanceof ArrayBuffer ? result : JSON.stringify(result);
+            resolve(output);
+          },
+          {
+            binary: true,
+            includeCustomExtensions: false,
+            forceIndices: true,
+            truncateDrawRange: true,
+          },
+          (error) => reject(error)
+        );
+      });
+    };
+  
+    const processModels = async () => {
+      const loader = new FBXLoader();
+      const newFileSizes = [];
+      const newConvertedModels = [];
+      const newLodModels = [];
+      const newSimplificationStats = [];
+  
+      cumulativeBoundingBox.current = new THREE.Box3(
+        new THREE.Vector3(Infinity, Infinity, Infinity),
+        new THREE.Vector3(-Infinity, -Infinity, -Infinity)
+      );
+  
+      const totalSteps = selectedFiles.length * (4 + 1);
+      let completedSteps = 0;
+  
+      for (const file of selectedFiles) {
+        try {
+          workerRef.current.postMessage({ type: 'loadModel', modelName: file.name, lodLevel: 'LOD0' });
+  
+          const fbxObject = await new Promise((resolve, reject) => {
+            loader.load(
+              URL.createObjectURL(file),
+              (object) => resolve(object),
+              undefined,
+              (error) => reject(error)
+            );
+          });
+  
+          fbxObject.traverse((child) => {
+            if (child.isMesh) {
+              child.material = new THREE.MeshBasicMaterial({ color: 0xcccccc });
             }
           });
-          newSimplificationStats.push({ fileName: file.name, lodName: level.name, meshStats });
-          return { name: level.name, object: lodObject };
-        });
   
-        for (const lod of lodVersions) {
-          const glbData = await convertToGLB(lod.object);
-          await storeModelInIndexedDB(file.name, lod.name, glbData);
-          
-          const compressedData = pako.gzip(glbData);
-          modelFileSizes.lodSizes.push({
-            name: lod.name,
-            size: compressedData.byteLength
+          const lodLevels = [
+            { name: 'LOD0', reduction: 0 },
+            { name: 'LOD1', reduction: 0.25 },
+            { name: 'LOD2', reduction: 0.5 },
+            { name: 'LOD3', reduction: 0.75 }
+          ];
+          const modelFileSizes = {
+            name: file.name,
+            fbxSize: file.size,
+            lodSizes: []
+          };
+  
+          const lodVersions = lodLevels.map(level => {
+            const lodObject = fbxObject.clone();
+            const meshStats = [];
+            lodObject.traverse((child) => {
+              if (child.isMesh && child.geometry) {
+                const result = simplifyGeometry(child.geometry, level.reduction);
+                child.geometry = result.geometry;
+                meshStats.push(result);
+              }
+            });
+            newSimplificationStats.push({ fileName: file.name, lodName: level.name, meshStats });
+            return { name: level.name, object: lodObject };
           });
+  
+          for (const lod of lodVersions) {
+            const glbData = await convertToGLB(lod.object);
+            await storeModelInIndexedDB(file.name, lod.name, glbData);
+            
+            const compressedData = pako.gzip(glbData);
+            modelFileSizes.lodSizes.push({
+              name: lod.name,
+              size: compressedData.byteLength
+            });
+  
+            completedSteps++;
+            setProcessingProgress((completedSteps / totalSteps) * 100);
+          }
+          newFileSizes.push(modelFileSizes);
   
           completedSteps++;
           setProcessingProgress((completedSteps / totalSteps) * 100);
+  
+        } catch (error) {
+          console.error("Error processing model:", error);
         }
-        newFileSizes.push(modelFileSizes);
-  
-        // Load and add LOD0 to the scene
-        const lod0Data = await loadModelFromIndexedDB(file.name, 'LOD0');
-        if (lod0Data) {
-          const gltfLoader = new GLTFLoader();
-          const gltfObject = await new Promise((resolve, reject) => {
-            gltfLoader.parse(lod0Data.buffer, "", (gltf) => resolve(gltf.scene), reject);
-          });
-  
-          sceneRef.current.add(gltfObject);
-          const boundingBox = new THREE.Box3().setFromObject(gltfObject);
-          cumulativeBoundingBox.current.union(boundingBox);
-        }
-  
-        completedSteps++;
-        setProcessingProgress((completedSteps / totalSteps) * 100);
-  
-      } catch (error) {
-        console.error("Error processing model:", error);
       }
-    }
   
-    setSimplificationStats(newSimplificationStats);
-    setFileSizes(newFileSizes);
-    setConvertedModels(newConvertedModels);
-    setLodModels(newLodModels);
-    initializeOctree();
+      setSimplificationStats(newSimplificationStats);
+      setFileSizes(newFileSizes);
+      setConvertedModels(newConvertedModels);
+      setLodModels(newLodModels);
+      initializeOctree();
   
-    // Reset progress when done
-    setProcessingProgress(0);
-  };
+      setProcessingProgress(0);
+    };
+  
   const simplifyGeometry = (geometry, targetReduction) => {
   const originalVertexCount = geometry.attributes.position.count;
   
@@ -533,7 +507,7 @@ const updateLODs = useCallback(() => {
       const currentLOD = object.name.split('_')[1];
 
       if (lodLevel !== currentLOD) {
-        const newLODData = await loadModelFromIndexedDB(modelName, lodLevel);
+        const newLODData = await storeModelInIndexedDB(modelName, lodLevel);
         if (newLODData) {
           const gltfLoader = new GLTFLoader();
           const newObject = await new Promise((resolve, reject) => {
@@ -634,62 +608,28 @@ const updateLODs = useCallback(() => {
         controlsRef.current.target.copy(center);
         controlsRef.current.update();
       };
-
+    
       const loadAllModelsToScene = async () => {
-    if (!db) {
-      alert("Database not initialized. Please wait and try again.");
-      return;
-    }
-  
-    // Clear existing scene
-    while(sceneRef.current.children.length > 0){ 
-      sceneRef.current.remove(sceneRef.current.children[0]); 
-    }
-  
-    const tx = db.transaction("models", "readonly");
-    const store = tx.objectStore("models");
-    const keys = await store.getAllKeys();
-    const gltfLoader = new GLTFLoader();
-  
-    // Reset the cumulative bounding box
-    cumulativeBoundingBox.current = new THREE.Box3();
-  
-    const totalModels = keys.length;
-    let loadedModels = 0;
-
-    const loadPromises = keys.map(async (key) => {
-      const compressedData = await store.get(key);
-      try {
-        const glbData = pako.ungzip(compressedData);
-        const gltfObject = await new Promise((resolve, reject) => {
-          gltfLoader.parse(glbData.buffer, "", (gltf) => resolve(gltf.scene), reject);
-        });
-        
-        gltfObject.name = key;
-        sceneRef.current.add(gltfObject);
-  
-        const boundingBox = new THREE.Box3().setFromObject(gltfObject);
-        cumulativeBoundingBox.current.union(boundingBox);
-
-        loadedModels++;
-        setLoadingProgress((loadedModels / totalModels) * 100);
-      } catch (error) {
-        console.error("Error loading model from IndexedDB:", error);
-      }
-    });
-  
-    // Wait for all models to be loaded before closing the transaction
-    await Promise.all(loadPromises);
-  
-    // Ensure the transaction is completed
-    await tx.done;
-  
-    resetCameraView();
-    initializeOctree();
-
-    // Reset progress when done
-    setLoadingProgress(0);
-  };
+        if (!db) {
+          alert("Database not initialized. Please wait and try again.");
+          return;
+        }
+    
+        // Clear existing scene
+        while(sceneRef.current.children.length > 0){ 
+          sceneRef.current.remove(sceneRef.current.children[0]); 
+        }
+    
+        const tx = db.transaction("models", "readonly");
+        const store = tx.objectStore("models");
+        const keys = await store.getAllKeys();
+    
+        // Reset the cumulative bounding box
+        cumulativeBoundingBox.current = new THREE.Box3();
+    
+        // Use the worker to load all models
+        workerRef.current.postMessage({ type: 'loadAllModels', keys });
+      };
     
       const initializeOctree = () => {
         const scene = sceneRef.current;
@@ -708,8 +648,7 @@ const updateLODs = useCallback(() => {
         newOctree.updateBoundingBoxes();
         setOctree(newOctree);
       };
-      
-      // Call this function whenever the scene changes significantly
+    
       const updateOctree = () => {
         if (octree) {
           octree.reinsertObjects();
