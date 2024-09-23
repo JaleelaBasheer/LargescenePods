@@ -93,6 +93,7 @@ function TestScene() {
   const [flyInsideStaticFrustum, setFlyInsideStaticFrustum] = useState(false);
   const octreeRef = useRef(null);
   const [visibleOctants, setVisibleOctants] = useState(0);
+  const flyCameraHelperRef = useRef(null);
   useEffect(() => {
     enablefycontrols();
     return () => {
@@ -168,8 +169,11 @@ useEffect(() => {
     camera2Ref.current.lookAt(center);
 
     // Fly camera (perspective)
-    camera1Ref.current = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+    camera1Ref.current = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 100);
     camera1Ref.current.position.set(center.x, center.y, center.z + maxDim / 2);
+ // Create and add camera helper for fly camera
+ flyCameraHelperRef.current = new THREE.CameraHelper(camera1Ref.current);
+ sceneRef.current.add(flyCameraHelperRef.current);
 
     // Add a grid helper for reference
     const gridHelper = new THREE.GridHelper(maxDim * 2, 20);
@@ -186,7 +190,7 @@ useEffect(() => {
     // Animate and render the scene
     function animate() {
       requestAnimationFrame(animate);
-
+ flyCameraHelperRef.current.update();
       // Update frustum for fly camera
       flyFrustum.setFromProjectionMatrix(
         new THREE.Matrix4().multiplyMatrices(
