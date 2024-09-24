@@ -155,8 +155,21 @@ class Octree {
     const [loadingProgress, setLoadingProgress] = useState(0);
     const [culledMeshes, setCulledMeshes] = useState(0);
     const [unculledMeshes, setUnculledMeshes] = useState(0);
+    const mouse = useRef({ x: 0, y: 0 });
+    const isMouseDown = useRef(false);
+    const isPanning = useRef(false);
+    const isZooming = useRef(false);
+    const lastMouseMovement = useRef({ x: 0, y: 0 });
+    const [flySpeed, setFlySpeed] = useState(.1); 
+    const [flyrotationSpeed, setflyrotationSpeed] = useState(.1); 
   
     const workerRef = useRef(null);
+    useEffect(() => {
+      enablefycontrols();
+      return () => {
+          disableflycontrols();
+      };
+  }, [flySpeed, flyrotationSpeed]);
   
     useEffect(() => {
       workerRef.current = new Worker(new URL('./meshLoaderWorker.js', import.meta.url));
@@ -179,9 +192,9 @@ class Octree {
       directionalLight.position.set(0, 1, 0);
       sceneRef.current.add(directionalLight);
   
-      controlsRef.current = new OrbitControls(cameraRef.current, rendererRef.current.domElement);
-      controlsRef.current.enableDamping = true;
-      controlsRef.current.dampingFactor = 0.1;
+      // controlsRef.current = new OrbitControls(cameraRef.current, rendererRef.current.domElement);
+      // controlsRef.current.enableDamping = true;
+      // controlsRef.current.dampingFactor = 0.1;
   
       const handleResize = () => {
         const width = window.innerWidth;
@@ -194,7 +207,7 @@ class Octree {
       window.addEventListener("resize", handleResize);
       return () => {
         mountRef.current.removeChild(rendererRef.current.domElement);
-        controlsRef.current.dispose();
+        // controlsRef.current.dispose();
         window.removeEventListener("resize", handleResize);
       };
     }, []);
@@ -299,8 +312,8 @@ class Octree {
   
       cameraRef.current.position.set(center.x, center.y, center.z + cameraZ);
       cameraRef.current.lookAt(center);
-      controlsRef.current.target.copy(center);
-      controlsRef.current.update();
+      // controlsRef.current.target.copy(center);
+      // controlsRef.current.update();
   
       setSelectedFiles(files);
       setProgress(0);
@@ -605,8 +618,8 @@ const updateLODs = useCallback(() => {
     
         cameraRef.current.position.set(center.x, center.y, center.z + cameraZ);
         cameraRef.current.lookAt(center);
-        controlsRef.current.target.copy(center);
-        controlsRef.current.update();
+        // controlsRef.current.target.copy(center);
+        // controlsRef.current.update();
       };
     
       const loadAllModelsToScene = async () => {
@@ -779,7 +792,7 @@ const updateLODs = useCallback(() => {
       const animate = useCallback(() => {
         requestAnimationFrame(animate);
         if (isVisible) {
-          controlsRef.current.update();
+          // controlsRef.current.update();
           cameraRef.current.updateMatrixWorld();
           cameraRef.current.updateProjectionMatrix();
           updateLODs();
@@ -791,7 +804,136 @@ const updateLODs = useCallback(() => {
         useEffect(() => {
           animate();
         }, [animate]);
-      
+        let continueTranslation = false;
+        let continueRotation = false;
+        let translationDirection = 0;
+        let rotationDirection = 0;
+        let translationSpeed = 1; // Initial translation speed
+        let rotationSpeed = 0.0001; // Initial rotation speed
+        // Define sensitivity constants
+        const horizontalSensitivity = 1.1; // Adjust as needed
+        const verticalSensitivity = 1.1; // Adjust as needed
+        
+        // mouse events functions on fly control
+        const handleMouseUp = () => {
+          isMouseDown.current = false;
+          isPanning.current = false;
+          isZooming.current = false;    
+          lastMouseMovement.current = { x: 0, y: 0 };
+          continueTranslation = false;
+          continueRotation = false;
+        };
+        const handleMouseDown = (event) => {
+            const mouseEvent = event.touches ? event.touches[0] : event;
+            if (mouseEvent.button === 0) { // Left mouse button pressed
+              isMouseDown.current = true;
+              mouse.current.x = mouseEvent.clientX;
+              mouse.current.y = mouseEvent.clientY;
+              isZooming.current = true;
+              continueTranslation = true; // Enable automatic translation
+              continueRotation = true; // Enable automatic rotation
+              translationDirection = lastMouseMovement.current.y > 0 ? 1 : -1; // Set translation direction based on last mouse movement
+              rotationDirection = lastMouseMovement.current.x > 0 ? 1 : -1; // Set rotation direction based on last mouse movement
+            } else if (mouseEvent.button === 1) { // Middle mouse button pressed
+              console.log("middlebutton pressed");
+              isPanning.current = true;
+              continueTranslation = true; // Enable automatic translation
+              mouse.current.x = mouseEvent.clientX;
+              mouse.current.y = mouseEvent.clientY;
+            }
+          };
+         
+          const handleMouseMove = (event) => {
+            event.preventDefault();
+        
+            const mouseEvent = event.touches ? event.touches[0] : event;
+            if (!isMouseDown.current && !isPanning.current && !isZooming.current) return;
+        
+            const movementX = mouseEvent.clientX - mouse.current.x;
+            const movementY = mouseEvent.clientY - mouse.current.y;
+        
+            lastMouseMovement.current = { x: movementX, y: movementY };
+            if (isMouseDown.current) { // Left mouse button clicked
+              const isHorizontal = Math.abs(movementX) > Math.abs(movementY);
+              if (isHorizontal) { // Horizontal movement, rotate around Y axis
+                continueCameraMovement(); 
+              } else { // Vertical movement, forward/backward
+                continueCameraMovement(); // Adjust with factors
+              }
+            } else if (isPanning.current) { // Middle mouse button clicked
+              continueCameraMovement(movementX, movementY); // Adjust with factors
+            }
+        
+            mouse.current.x = mouseEvent.clientX;
+            mouse.current.y = mouseEvent.clientY;
+          };
+        
+          const continueCameraMovement = () => {
+            const adjustedTranslationSpeed = flySpeed * translationSpeed;
+            if (isMouseDown.current && (continueTranslation || continueRotation)) {
+              requestAnimationFrame(continueCameraMovement);
+              const movementX = lastMouseMovement.current.x;
+              const movementY = lastMouseMovement.current.y;
+              const tileSizeFactor = 10; // Implement this function to calculate the factor based on tile size
+              const isHorizontal = Math.abs(movementX) > Math.abs(movementY);
+              if (isHorizontal) {
+                const rotationAngle = -movementX * rotationSpeed * horizontalSensitivity * flyrotationSpeed * tileSizeFactor;
+        
+                // Get the camera's up vector
+                let cameraUp = cameraRef.current.up.clone().normalize();
+                
+                // Create a quaternion representing the rotation around the camera's up vector
+                let quaternion = new THREE.Quaternion().setFromAxisAngle(cameraUp, rotationAngle);
+                
+                cameraRef.current.applyQuaternion(quaternion);
+              } else {
+                const zoomSpeed = movementY * 0.01; // Adjust zoom speed based on last recorded mouse movement
+        
+                const forwardDirection = new THREE.Vector3(0, 0, 1).applyQuaternion(cameraRef.current.quaternion);
+                // Move the camera forward/backward along its local forward direction
+                cameraRef.current.position.add(forwardDirection.multiplyScalar(zoomSpeed * adjustedTranslationSpeed * tileSizeFactor));
+              }			
+            } else if (isPanning.current && continueTranslation) {
+              requestAnimationFrame(continueCameraMovement);
+              const tileSizeFactor = 0.001;
+              const movementY = lastMouseMovement.current.y;
+              const movementX = lastMouseMovement.current.x;
+              const adjustedHorizontalSensitivity = horizontalSensitivity * tileSizeFactor;
+              const adjustedVerticalSensitivity = verticalSensitivity * tileSizeFactor;
+        
+              // Calculate movement speed based on mouse movement and sensitivity
+              const moveSpeedX = movementX * adjustedHorizontalSensitivity;
+              const moveSpeedY = movementY * adjustedVerticalSensitivity;
+              
+              const isHorizontal = Math.abs(movementX) > Math.abs(movementY);
+              const isVertical = Math.abs(movementY) > Math.abs(movementX);
+            
+              if (isHorizontal) {
+                // Move the camera along its local x axis
+                cameraRef.current.translateX(moveSpeedX);
+              } else if (isVertical) {
+                // Move the camera along its local y axis
+                cameraRef.current.translateY(-moveSpeedY);
+              }
+            }
+          };
+        
+            // enablefycontrols
+            const enablefycontrols=()=>{
+            
+                document.addEventListener('mousedown', handleMouseDown);
+                document.addEventListener('mouseup', handleMouseUp);
+                document.addEventListener('mousemove', handleMouseMove);
+                
+                // document.addEventListener('wheel', handleWheel);
+            }
+            // disableflycontrols
+            const disableflycontrols=()=>{
+                document.removeEventListener('mousedown', handleMouseDown);
+                document.removeEventListener('mouseup', handleMouseUp);
+                document.removeEventListener('mousemove', handleMouseMove);    
+                // document.removeEventListener('wheel', handleWheel);
+            }   
       
   return (
     <div className="main">

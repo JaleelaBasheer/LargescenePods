@@ -169,7 +169,7 @@ useEffect(() => {
     camera2Ref.current.lookAt(center);
 
     // Fly camera (perspective)
-    camera1Ref.current = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 100);
+    camera1Ref.current = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
     camera1Ref.current.position.set(center.x, center.y, center.z + maxDim / 2);
  // Create and add camera helper for fly camera
  flyCameraHelperRef.current = new THREE.CameraHelper(camera1Ref.current);
